@@ -1,4 +1,4 @@
-name: Build 楽々JC
+name: Build RakurakuJC
 
 on:
   push:
@@ -6,88 +6,31 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ════════════════════════════════════════
-  #  Mac版 (.app)
-  # ════════════════════════════════════════
   build-mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Python セットアップ
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 依存パッケージをインストール
-        run: |
-          pip install pyinstaller python-docx tkinterdnd2
-
-      - name: ビルド
-        run: |
-          pyinstaller 楽々JC.spec --noconfirm
-
-      - name: ZIPに圧縮
-        run: |
-          cd dist
-          zip -r 楽々JC_Mac.zip 楽々JC.app
-
-      - name: アーティファクトとして保存
-        uses: actions/upload-artifact@v4
+      - run: pip install pyinstaller python-docx tkinterdnd2
+      - run: pyinstaller 楽々JC.spec --noconfirm
+      - run: cd dist && zip -r RakurakuJC_Mac.zip 楽々JC.app
+      - uses: actions/upload-artifact@v4
         with:
-          name: 楽々JC_Mac
-          path: dist/楽々JC_Mac.zip
+          name: RakurakuJC_Mac
+          path: dist/RakurakuJC_Mac.zip
 
-  # ════════════════════════════════════════
-  #  Windows版 (.exe)
-  # ════════════════════════════════════════
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Python セットアップ
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 依存パッケージをインストール
-        run: |
-          pip install pyinstaller python-docx tkinterdnd2
-
-      - name: Windows用specファイルを作成
-        run: |
-          python -c "
-          with open('楽々JC.spec', 'r', encoding='utf-8') as f:
-              src = f.read()
-          # Mac専用のBUNDLE部分をWindowsでは除外
-          src = src.replace(
-              'app = BUNDLE(',
-              '# app = BUNDLE('
-          )
-          lines = src.split('\n')
-          new_lines = []
-          in_bundle = False
-          for line in lines:
-              if '# app = BUNDLE(' in line:
-                  in_bundle = True
-              if in_bundle:
-                  new_lines.append('# ' + line if not line.startswith('#') else line)
-                  if line.strip() == ')':
-                      in_bundle = False
-              else:
-                  new_lines.append(line)
-          with open('楽々JC_win.spec', 'w', encoding='utf-8') as f:
-              f.write('\n'.join(new_lines))
-          print('Windows spec作成完了')
-          "
-
-      - name: ビルド
-        run: |
-          pyinstaller rakuraku_jc.py --noconfirm --onefile --windowed --name 楽々JC
-
-      - name: アーティファクトとして保存
-        uses: actions/upload-artifact@v4
+      - run: pip install pyinstaller python-docx tkinterdnd2
+      - run: pyinstaller rakuraku_jc.py --noconfirm --onefile --windowed --name RakurakuJC
+      - uses: actions/upload-artifact@v4
         with:
-          name: 楽々JC_Windows
-          path: dist/楽々JC.exe
+          name: RakurakuJC_Windows
+          path: dist/RakurakuJC.exe
