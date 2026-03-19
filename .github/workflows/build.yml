@@ -17,9 +17,9 @@ jobs:
         pip install pyinstaller python-docx tkinterdnd2
     - name: Build EXE
       run: |
-        pyinstaller --onedir --windowed --name "LinkForge" linkforge.py
+        pyinstaller --onedir --windowed --name "楽々JC" linkforge.py
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: LinkForge-Windows
-        path: dist/LinkForge/
+        name: RakurakuJC-Windows
+        path: dist/楽々JC/
