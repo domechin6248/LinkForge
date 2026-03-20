@@ -12,6 +12,8 @@ tkinterdnd2 によるドラッグ&ドロップ対応
 
 import os
 import sys
+import re
+import csv
 import shutil
 import threading
 import platform
@@ -29,6 +31,7 @@ try:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.shared import RGBColor as DocxRGBColor, Pt as DocxPt
 except ImportError:
     root = tk.Tk(); root.withdraw()
     messagebox.showerror("エラー",
@@ -37,6 +40,30 @@ except ImportError:
         "【Mac】  python3 -m pip install python-docx\n"
         "【Win】  python -m pip install python-docx")
     sys.exit(1)
+
+# ── openpyxl (チェッカー Excel処理) ──────────────────────────────
+try:
+    import openpyxl
+    from openpyxl.styles import Font as OpenpyxlFont
+    _OPENPYXL_OK = True
+except ImportError:
+    _OPENPYXL_OK = False
+
+# ── python-pptx (チェッカー PPT処理) ─────────────────────────────
+try:
+    from pptx import Presentation as PptxPresentation
+    from pptx.dml.color import RGBColor as PptxRGBColor
+    from pptx.util import Pt as PptxPt
+    _PPTX_OK = True
+except ImportError:
+    _PPTX_OK = False
+
+# ── pdfplumber (チェッカー PDF解析) ──────────────────────────────
+try:
+    import pdfplumber
+    _PDFPLUMBER_OK = True
+except ImportError:
+    _PDFPLUMBER_OK = False
 
 # ── D&D ──────────────────────────────────────────────────────────
 _DND_BACKEND = None
@@ -640,6 +667,56 @@ def process_paragraph(para, fm, part):
 #    画像    → Pillow → LibreOffice の順でフォールバック
 # ════════════════════════════════════════════════════════════════
 
+# Mac で LibreOffice 変換時のフォント置換マップ
+# Windows 専用日本語フォント → 游フォント（macOS 10.11+ 標準搭載、同系統で行間メトリクス近似）
+# ※ HiraginoはMS明朝より行間メトリクスが大きく、w:line="0"と組み合わさると行間崩れの原因になる
+_MAC_FONT_MAP = {
+    # 明朝系 → 游明朝（MS明朝と同じFontworks設計、macOS標準搭載）
+    "ＭＳ 明朝":      "游明朝",
+    "ＭＳ Ｐ明朝":    "游明朝",
+    "MS Mincho":      "游明朝",
+    "MS PMincho":     "游明朝",
+    # ゴシック系 → 游ゴシック（同系統）
+    "ＭＳ ゴシック":   "游ゴシック",
+    "ＭＳ Ｐゴシック": "游ゴシック",
+    "MS Gothic":      "游ゴシック",
+    "MS PGothic":     "游ゴシック",
+    "メイリオ":        "游ゴシック",
+    "Meiryo":         "游ゴシック",
+}
+
+import re as _re
+
+
+def _patch_ms_fonts(src: Path) -> Path:
+    r"""Mac 向け: Windowsフォント名を Mac 互換フォント名に置換した一時ファイルを返す。
+    また w:line="0" w:lineRule="atLeast" を単一行間 (line=240, auto) に補正する。
+    Word は line=0 を「自動行間」として扱うが LibreOffice は「0pt以上」と解釈し、
+    フォントメトリクスが大きいと巨大な行間になるため修正が必要。"""
+    import zipfile
+    import tempfile
+    tmp = Path(tempfile.mktemp(suffix=src.suffix))
+    with zipfile.ZipFile(src, "r") as zin, \
+         zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.endswith(".xml") or item.filename.endswith(".rels"):
+                text = data.decode("utf-8", errors="replace")
+                # ① フォント名置換
+                for win_font, mac_font in _MAC_FONT_MAP.items():
+                    text = text.replace(win_font, mac_font)
+                # ② w:line="0" w:lineRule="atLeast" → 単一行間に補正
+                text = _re.sub(
+                    r'(w:line="0")(\s+)(w:lineRule="atLeast")',
+                    r'w:line="240"\2w:lineRule="auto"', text)
+                text = _re.sub(
+                    r'(w:lineRule="atLeast")(\s+)(w:line="0")',
+                    r'w:lineRule="auto"\2w:line="240"', text)
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
+    return tmp
+
+
 # LibreOffice フォールバック用フィルタマップ
 _LO_FILTER_MAP = {
     **{e: "writer_pdf_Export"  for e in _WORD_EXTS},
@@ -664,20 +741,40 @@ def _get_libreoffice_path():
 
 
 def _convert_libreoffice(input_path: Path, output_dir: Path, ext: str):
-    """LibreOffice によるフォールバック変換"""
+    """LibreOffice によるフォールバック変換。
+    Mac では Windows 専用フォントを Hiragino 系に置換してから変換する。"""
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Mac + Office ファイル → フォント置換した一時ファイルで変換
+    patched: Path | None = None
+    convert_path = input_path
+    if platform.system() == "Darwin" and ext in (
+        _WORD_EXTS | _EXCEL_EXTS | _PPT_EXTS
+    ):
+        try:
+            patched = _patch_ms_fonts(input_path)
+            convert_path = patched
+        except Exception:
+            pass  # 置換失敗時は元ファイルで続行
+
     lo = _get_libreoffice_path()
     lo_filter = _LO_FILTER_MAP.get(ext, "writer_pdf_Export")
     cmd = (
         f'{lo} --headless --norestore --nofirststartwizard '
         f'--convert-to "pdf:{lo_filter}" '
-        f'"{input_path}" --outdir "{output_dir}"'
+        f'"{convert_path}" --outdir "{output_dir}"'
     )
     try:
         result = subprocess.run(cmd, shell=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=120)
+        # 出力ファイル名は元のstemで確定（patchedファイルはtempなので）
         out_pdf = output_dir / (input_path.stem + ".pdf")
+        if not out_pdf.exists() and patched:
+            # LibreOffice は変換元ファイル名で出力するため、temp名で生成された可能性
+            tmp_pdf = output_dir / (patched.stem + ".pdf")
+            if tmp_pdf.exists():
+                tmp_pdf.rename(out_pdf)
         if out_pdf.exists():
             return True, str(out_pdf)
         err = result.stderr.decode(errors="ignore")
@@ -686,6 +783,12 @@ def _convert_libreoffice(input_path: Path, output_dir: Path, ext: str):
         return False, "タイムアウト（120秒）"
     except Exception as e:
         return False, str(e)
+    finally:
+        if patched and patched.exists():
+            try:
+                patched.unlink()
+            except Exception:
+                pass
 
 
 def _convert_image(input_path: Path, output_dir: Path):
@@ -863,7 +966,7 @@ def _convert_windows(input_path: Path, output_dir: Path, ext: str):
 # ── Mac AppleScript ───────────────────────────────────────────
 
 def _esc_as(s: str) -> str:
-    """AppleScript 文字列リテラル用エスケープ（" と \ を処理）"""
+    r"""AppleScript 文字列リテラル用エスケープ（" と \ を処理）"""
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
@@ -920,9 +1023,7 @@ tell application "Microsoft Excel"
         open POSIX file "{_esc_as(abs_in)}"
         delay 2
         try
-            tell active workbook
-                save as filename "{_esc_as(abs_out)}" file format PDF file format
-            end tell
+            save workbook as (active workbook) filename "{_esc_as(abs_out)}" file format PDF file format
         end try
         close (active workbook) saving no
     on error errMsg
@@ -983,8 +1084,10 @@ def _convert_mac(input_path: Path, output_dir: Path, ext: str):
     else:
         return _convert_libreoffice(input_path, output_dir, ext)
 
-    # result[0] が None = Office 未インストール → LibreOffice にフォールバック
-    if result[0] is None:
+    # result[0] が None = Office 未インストール
+    # result[0] が False = AppleScript 失敗
+    # → どちらも LibreOffice にフォールバック
+    if not result[0]:
         return _convert_libreoffice(input_path, output_dir, ext)
     return result
 
@@ -1057,10 +1160,11 @@ def build_header(parent, title, subtitle, show_version=True, on_update=None):
 
 class LauncherFrame(tk.Frame):
 
-    def __init__(self, parent, on_link, on_pdf):
+    def __init__(self, parent, on_link, on_pdf, on_checker):
         super().__init__(parent, bg=C["bg"])
-        self.on_link = on_link
-        self.on_pdf  = on_pdf
+        self.on_link    = on_link
+        self.on_pdf     = on_pdf
+        self.on_checker = on_checker
         self._build()
 
     def _build(self):
@@ -1073,13 +1177,15 @@ class LauncherFrame(tk.Frame):
                  ).pack(pady=(40, 32))
         btn_area = tk.Frame(center, bg=C["bg"])
         btn_area.pack()
-        self._feature_btn(btn_area, "⛓", "リンク一括設定",
-                          "Wordファイルへ\nハイパーリンクを自動挿入",
-                          self.on_link, col=0)
+        self._feature_btn(btn_area, "⚓", "統一ルール修正",
+                          "Word / Excel / PPT / PDF\n統一語句チェック・修正",
+                          self.on_checker, col=0)
         self._feature_btn(btn_area, "📄", "PDF一括変換",
                           "Word / Excel / PowerPoint等を\nPDFに一括変換",
                           self.on_pdf, col=1)
-        self._placeholder_btn(btn_area, col=2)
+        self._feature_btn(btn_area, "⛓", "リンク一括設定",
+                          "Wordファイルへ\nハイパーリンクを自動挿入",
+                          self.on_link, col=2)
         tk.Label(center, text=f"楽々JC  v{APP_VERSION}",
                  font=("Helvetica", 8),
                  bg=C["bg"], fg="#5A7AAA"
@@ -1125,10 +1231,12 @@ class LauncherFrame(tk.Frame):
 
 class LinkFrame(LoggedFrame):
 
-    def __init__(self, parent, on_back, on_go_pdf, dnd_ok, on_check_update=None):
+    def __init__(self, parent, on_back, on_go_pdf, on_go_checker, dnd_ok,
+                 on_check_update=None):
         super().__init__(parent, bg=C["bg"])
         self.on_back         = on_back
         self.on_go_pdf       = on_go_pdf
+        self.on_go_checker   = on_go_checker
         self.dnd_ok          = dnd_ok
         self.on_check_update = on_check_update
         self.folder_name_entries = []
@@ -1140,7 +1248,9 @@ class LinkFrame(LoggedFrame):
         nav = tk.Frame(self, bg=C["bg"])
         nav.pack(fill=tk.X, padx=16, pady=(8, 0))
         nav_button(nav, "← ホームへ戻る", self.on_back).pack(side=tk.LEFT)
-        nav_button(nav, "PDF一括変換へ →", self.on_go_pdf).pack(side=tk.RIGHT)
+        nav_button(nav, "PDF一括変換へ →",     self.on_go_pdf).pack(side=tk.RIGHT)
+        nav_button(nav, "統一語句チェックへ →", self.on_go_checker).pack(
+            side=tk.RIGHT, padx=(0, 6))
         self.dnd_lbl = tk.Label(nav,
                                 text="D&D ✓" if self.dnd_ok else "---",
                                 font=("Helvetica", 9), bg=C["bg"],
@@ -1346,10 +1456,11 @@ class LinkFrame(LoggedFrame):
 
 class PdfFrame(LoggedFrame):
 
-    def __init__(self, parent, on_back, on_go_link):
+    def __init__(self, parent, on_back, on_go_link, on_go_checker):
         super().__init__(parent, bg=C["bg"])
-        self.on_back    = on_back
-        self.on_go_link = on_go_link
+        self.on_back       = on_back
+        self.on_go_link    = on_go_link
+        self.on_go_checker = on_go_checker
         self._cancel_flag = threading.Event()
         self._build()
 
@@ -1359,7 +1470,9 @@ class PdfFrame(LoggedFrame):
         nav = tk.Frame(self, bg=C["bg"])
         nav.pack(fill=tk.X, padx=16, pady=(8, 0))
         nav_button(nav, "← ホームへ戻る", self.on_back).pack(side=tk.LEFT)
-        nav_button(nav, "リンク一括設定へ →", self.on_go_link).pack(side=tk.RIGHT)
+        nav_button(nav, "リンク一括設定へ →",    self.on_go_link).pack(side=tk.RIGHT)
+        nav_button(nav, "統一語句チェックへ →", self.on_go_checker).pack(
+            side=tk.RIGHT, padx=(0, 6))
 
         _, main = make_scrollable_frame(self)
         pad = dict(padx=16, pady=(0, 10))
@@ -1373,40 +1486,13 @@ class PdfFrame(LoggedFrame):
         self.src_zone.pack(fill=tk.X, **pad)
         self.src_zone.on_change = self._update_count
 
-        # ── 出力先（DropZone D&D 対応）──
-        out_frame = tk.Frame(main, bg=C["surface"],
-                             highlightbackground=C["border"],
-                             highlightthickness=2)
-        out_frame.pack(fill=tk.X, **pad)
-        tk.Label(out_frame, text="▸ 出力先",
-                 font=("Helvetica", 12, "bold"),
-                 bg=C["surface"], fg=C["text"]
-                 ).pack(anchor="w", padx=14, pady=(10, 4))
-
-        mode_row = tk.Frame(out_frame, bg=C["surface"])
-        mode_row.pack(fill=tk.X, padx=14)
-        tk.Label(mode_row, text="保存先:",
-                 font=("Helvetica", 9), bg=C["surface"], fg=C["sub"]
-                 ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.out_mode = tk.StringVar(value="same")
-        for val, lbl in [("same", "元ファイルと同じフォルダ"), ("custom", "指定フォルダ")]:
-            tk.Radiobutton(
-                mode_row, text=lbl, variable=self.out_mode, value=val,
-                command=self._toggle_custom_out,
-                font=("Helvetica", 9),
-                bg=C["surface"], fg=C["text"],
-                selectcolor=C["input_bg"],
-                activebackground=C["surface"],
-                relief=tk.FLAT
-            ).pack(side=tk.LEFT, padx=(0, 14))
-
+        # ── 出力先（常時表示・常時D&D対応）──
         self.custom_out_zone = DropZone(
-            out_frame, "指定出力フォルダ",
-            "出力先フォルダをドラッグ&ドロップ、またはクリックして選択",
+            main, "出力先",
+            "省略時は元ファイルと同じフォルダに保存  /  フォルダをドロップして出力先を指定",
             select_mode="folder", allow_multiple=False
         )
-        tk.Frame(out_frame, bg=C["surface"], height=8).pack()
+        self.custom_out_zone.pack(fill=tk.X, **pad)
 
         # ── 変換エンジン表示 ──
         _os = platform.system()
@@ -1456,12 +1542,6 @@ class PdfFrame(LoggedFrame):
                       "⚠️  LibreOffice が見つかりません（フォールバック不可）",
                       "warning")
 
-    def _toggle_custom_out(self):
-        if self.out_mode.get() == "custom":
-            self.custom_out_zone.pack(fill=tk.X, padx=14, pady=(6, 4))
-        else:
-            self.custom_out_zone.pack_forget()
-
     def _update_count(self):
         paths = self.src_zone.selected_paths
         if not paths:
@@ -1500,10 +1580,9 @@ class PdfFrame(LoggedFrame):
 
     def _worker(self):
         try:
-            src_paths    = self.src_zone.selected_paths
-            use_custom   = (self.out_mode.get() == "custom")
-            custom_paths = self.custom_out_zone.selected_paths if use_custom else []
-            base_custom  = Path(custom_paths[0]) if custom_paths else None
+            src_paths   = self.src_zone.selected_paths
+            base_custom = (Path(self.custom_out_zone.selected_paths[0])
+                           if self.custom_out_zone.selected_paths else None)
 
             all_files = []  # [(file_path, src_root)]
             for sp in src_paths:
@@ -1534,8 +1613,10 @@ class PdfFrame(LoggedFrame):
                 except ValueError:
                     rel = Path(f.name)
 
-                if use_custom and base_custom:
-                    out_dir = base_custom / rel.parent
+                if base_custom:
+                    # src_root.name を挟むことで、複数フォルダを同時投入しても
+                    # 出力先に「ドロップ元フォルダ名/階層」が再現される
+                    out_dir = base_custom / src_root.name / rel.parent
                 else:
                     out_dir = f.parent
 
@@ -1595,6 +1676,1090 @@ class PdfFrame(LoggedFrame):
 
 
 # ════════════════════════════════════════════════════════════════
+#  統一ルール修正チェッカー  ─  コアロジック
+# ════════════════════════════════════════════════════════════════
+
+def _checker_load_rules(csv_path):
+    """rules.csv を読み込み {類義語: 統一語句} の辞書を返す（長さ降順）"""
+    result = {}
+    for enc in ('utf-8-sig', 'shift-jis', 'utf-8', 'cp932'):
+        try:
+            with open(csv_path, encoding=enc, newline='') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                fields = reader.fieldnames or []
+            if '類義語' in fields and '統一語句' in fields:
+                rows = sorted(rows, key=lambda r: len(r.get('類義語', '')), reverse=True)
+                for row in rows:
+                    k = row['類義語'].strip()
+                    v = row['統一語句'].strip()
+                    if k and v:
+                        result[k] = v
+                return result
+        except Exception:
+            continue
+    return result
+
+
+_CHECKER_KEEP_WORDS = [
+    "会員に成長する機会", "会員拡大運動", "会員拡大", "正会員", "新入会員",
+    "日本の青年会議所は", "希望をもたらす変革の起点として",
+    "輝く個性が調和する未来を描き", "社会の課題を解決することで",
+    "持続可能な地域を創ることを誓う", "われわれ JAYCEE は", "われわれJAYCEEは",
+    "志高き組織ビジョン", "志高き人材育成ビジョン", "志高きまち創造ビジョン",
+]
+
+_ZEN_ALNUM = "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９"
+_HAN_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+_ZEN2HAN   = str.maketrans(_ZEN_ALNUM, _HAN_ALNUM)
+_ALNUM_PAT = re.compile(r'([A-Za-z0-9Ａ-Ｚａ-ｚ０-９]+)')
+
+
+def _checker_apply_rules(target_text, rules, for_reporting=False):
+    """
+    テキストに統一ルールを適用。
+    戻り値: [(orig, curr, is_fixed, is_alnum), ...]
+    """
+    keep_words = list(_CHECKER_KEEP_WORDS)
+    for k, v in rules.items():
+        if k == v and k not in keep_words:
+            keep_words.append(k)
+    keep_words = sorted(keep_words, key=len, reverse=True)
+
+    # 保護フレーズをプレースホルダー置換
+    protected = target_text
+    placeholders = {}
+    for i, word in enumerate(keep_words):
+        if word in protected:
+            ph = f"《《保{i:04d}護》》"
+            placeholders[ph] = word
+            protected = protected.replace(word, ph)
+
+    # ルール適用
+    segments = [(protected, protected, False)]
+    for wrong, right in rules.items():
+        if wrong == right or not wrong:
+            continue
+        new_seg = []
+        for orig, curr, already in segments:
+            if already or str(wrong) not in curr:
+                new_seg.append((orig, curr, already))
+                continue
+            parts = curr.split(str(wrong))
+            for j, p in enumerate(parts):
+                if p:
+                    new_seg.append((p, p, False))
+                if j < len(parts) - 1:
+                    new_seg.append((str(wrong), str(right), True))
+        segments = new_seg
+
+    # プレースホルダーを元に戻す
+    restored = []
+    for orig, curr, is_fixed in segments:
+        t_orig, t_curr = orig, curr
+        if not is_fixed:
+            for ph, word in placeholders.items():
+                t_orig = t_orig.replace(ph, word)
+                t_curr = t_curr.replace(ph, word)
+        restored.append((t_orig, t_curr, is_fixed))
+
+    # 全角英数字を半角化
+    final = []
+    for orig, curr, is_fixed in restored:
+        if for_reporting and is_fixed:
+            new_curr = _ALNUM_PAT.sub(lambda m: m.group(1).translate(_ZEN2HAN), curr)
+            has_alnum = bool(_ALNUM_PAT.search(new_curr))
+            final.append((orig, new_curr, True, has_alnum))
+        else:
+            parts = _ALNUM_PAT.split(curr)
+            for i2, part in enumerate(parts):
+                if not part:
+                    continue
+                if i2 % 2 == 1:
+                    half = part.translate(_ZEN2HAN)
+                    was_conv = (half != part)
+                    if for_reporting:
+                        final.append((part, half, was_conv, True))
+                    else:
+                        final.append((orig, half, is_fixed or was_conv, False))
+                else:
+                    if for_reporting:
+                        final.append((part, part, False, False))
+                    else:
+                        final.append((orig, part, is_fixed, False))
+    return final
+
+
+def _checker_is_word_shaded(para):
+    """Word 段落に網掛け（背景色）があるか判定"""
+    try:
+        pPr = para._p.pPr
+        if pPr is not None:
+            shd = pPr.find(qn('w:shd'))
+            if shd is not None:
+                val  = shd.get(qn('w:val'))
+                fill = shd.get(qn('w:fill'))
+                if val and val != 'clear':
+                    return True
+                if fill and fill not in ('auto', 'FFFFFF', 'clear'):
+                    return True
+        parent = para._p.getparent()
+        if parent is not None and parent.tag.endswith('tc'):
+            tcPr = parent.find(qn('w:tcPr'))
+            if tcPr is not None:
+                shd = tcPr.find(qn('w:shd'))
+                if shd is not None:
+                    val  = shd.get(qn('w:val'))
+                    fill = shd.get(qn('w:fill'))
+                    if val and val != 'clear':
+                        return True
+                    if fill and fill not in ('auto', 'FFFFFF', 'clear'):
+                        return True
+    except Exception:
+        pass
+    return False
+
+
+def _checker_repair_docx(src_path, rules, rgb, out_path, protect_links=True):
+    """Word ファイルに統一ルールを適用（修正箇所を指定色で着色）。
+    戻り値: True = 1か所以上修正あり / False = 修正なし"""
+    doc = Document(str(src_path))
+    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    changed = [False]  # 内部関数から書き換えるためリストで保持
+
+    def _process_paragraphs(paragraphs):
+        for para in paragraphs:
+            is_shaded = _checker_is_word_shaded(para)
+            orig_bold = orig_size = None
+            if para.runs and para.runs[0].font:
+                orig_bold = para.runs[0].font.bold
+                orig_size = para.runs[0].font.size
+
+            elements = []
+            current_text = ""
+            try:
+                for child in list(para._p):
+                    if child.tag.endswith('hyperlink'):
+                        if protect_links:
+                            # リンクをカプセルごと退避（テキストは修正しない）
+                            if current_text:
+                                elements.append({"type": "text", "content": current_text})
+                                current_text = ""
+                            elements.append({"type": "link", "element": child})
+                            para._p.remove(child)
+                        else:
+                            # リンクのテキストも修正対象にする
+                            t_nodes = child.xpath('.//w:t', namespaces={'w': W_NS})
+                            text = "".join(t.text for t in t_nodes if t.text)
+                            current_text += text
+                            para._p.remove(child)
+                    elif child.tag.endswith('r') or child.tag.endswith('ins'):
+                        t_nodes = child.xpath('.//w:t', namespaces={'w': W_NS})
+                        text = "".join(t.text for t in t_nodes if t.text)
+                        current_text += text
+                        para._p.remove(child)
+                if current_text:
+                    elements.append({"type": "text", "content": current_text})
+            except Exception:
+                elements = [{"type": "text", "content": para.text}]
+                para.text = ""
+
+            for el in elements:
+                if el["type"] == "text":
+                    if not el["content"]:
+                        continue
+                    parts = _checker_apply_rules(el["content"], rules, for_reporting=False)
+                    for orig, curr, is_fixed, is_alnum in parts:
+                        run = para.add_run(curr)
+                        run.font.name = 'ＭＳ 明朝'
+                        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'ＭＳ 明朝')
+                        if is_shaded:
+                            if orig_size is not None:
+                                run.font.size = orig_size
+                            if orig_bold is not None:
+                                run.font.bold = orig_bold
+                        else:
+                            run.font.size = DocxPt(10.5)
+                        if is_fixed:
+                            changed[0] = True
+                            run.font.color.rgb = DocxRGBColor(rgb[0], rgb[1], rgb[2])
+                            run.bold = False
+                elif el["type"] == "link":
+                    para._p.append(el["element"])
+
+    _process_paragraphs(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                _process_paragraphs(cell.paragraphs)
+    if changed[0]:
+        doc.save(str(out_path))
+    return changed[0]
+
+
+def _checker_repair_xlsx(src_path, rules, rgb, out_path, protect_links=True):
+    """Excel ファイルに統一ルールを適用（修正箇所を指定色で着色）。
+    戻り値: True = 1か所以上修正あり / False = 修正なし"""
+    wb = openpyxl.load_workbook(str(src_path))
+    hex_color = f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+    changed = False
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if not (cell.value and isinstance(cell.value, str)):
+                    continue
+                if protect_links and cell.hyperlink:
+                    continue
+                is_shaded = False
+                if (cell.fill and cell.fill.patternType and
+                        cell.fill.patternType != 'none'):
+                    fc = cell.fill.fgColor.rgb
+                    if fc and fc not in ('00000000', 'FFFFFFFF', '00FFFFFF'):
+                        is_shaded = True
+                orig_bold = cell.font.bold if cell.font else False
+                orig_size = cell.font.size if cell.font else 11
+                parts = _checker_apply_rules(cell.value, rules, for_reporting=False)
+                if any(p[2] for p in parts) or any(p[3] for p in parts) or not is_shaded:
+                    cell.value = "".join(p[1] for p in parts)
+                    is_fixed_present = any(p[2] for p in parts)
+                    if is_fixed_present:
+                        changed = True
+                    new_color = hex_color if is_fixed_present else (
+                        cell.font.color if cell.font else None)
+                    new_size = orig_size if is_shaded else 10.5
+                    new_bold = orig_bold if is_shaded else False
+                    cell.font = OpenpyxlFont(
+                        name='ＭＳ 明朝', size=new_size,
+                        color=new_color, bold=new_bold)
+    if changed:
+        wb.save(str(out_path))
+    return changed
+
+
+def _checker_repair_pptx(src_path, rules, rgb, out_path, protect_links=True):
+    """PowerPoint ファイルに統一ルールを適用（修正箇所を指定色で着色）。
+    戻り値: True = 1か所以上修正あり / False = 修正なし"""
+    prs = PptxPresentation(str(src_path))
+    changed = False
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            is_shaded = hasattr(shape, "fill") and shape.fill.type == 1
+            if not (hasattr(shape, "text_frame") and shape.text_frame):
+                continue
+            for paragraph in shape.text_frame.paragraphs:
+                if protect_links:
+                    has_link = any(
+                        hasattr(run, "hyperlink") and run.hyperlink and run.hyperlink.address
+                        for run in paragraph.runs
+                    )
+                    if has_link:
+                        continue
+                combined = "".join(run.text for run in paragraph.runs)
+                parts = _checker_apply_rules(combined, rules, for_reporting=False)
+                if any(p[2] for p in parts) or any(p[3] for p in parts) or not is_shaded:
+                    paragraph.text = ""
+                    for orig, curr, is_fixed, is_alnum in parts:
+                        new_run = paragraph.add_run()
+                        new_run.text = curr
+                        new_run.font.name = 'ＭＳ 明朝'
+                        if not is_shaded:
+                            new_run.font.size = PptxPt(10.5)
+                        if is_fixed:
+                            changed = True
+                            new_run.font.color.rgb = PptxRGBColor(rgb[0], rgb[1], rgb[2])
+                            new_run.font.bold = False
+    if changed:
+        prs.save(str(out_path))
+    return changed
+
+
+def _checker_check_pdf(src_path, rules):
+    """PDF をチェックして修正推奨リストを返す"""
+    results = []
+    invisible = re.compile(r'[\s\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00A0]+')
+    with pdfplumber.open(str(src_path)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if not text:
+                continue
+            pure = re.sub(invisible, '', text)
+            parts = _checker_apply_rules(pure, rules, for_reporting=True)
+            full_text = "".join(p[1] for p in parts)
+            idx = 0
+            for orig, curr, is_fixed, is_alnum in parts:
+                if is_fixed:
+                    s = max(0, idx - 15)
+                    e = min(len(full_text), idx + len(curr) + 15)
+                    ctx = full_text[s:e]
+                    reason = ("英数字の半角化"
+                              if orig.translate(_ZEN2HAN) == curr and orig != curr
+                              else "統一ルールの適用")
+                    results.append({
+                        "ページ":    i + 1,
+                        "NGワード":  orig,
+                        "修正案":    curr,
+                        "修正理由":  reason,
+                        "周辺の文章": f"…{ctx}…",
+                    })
+                idx += len(curr)
+    return results
+
+
+def _checker_expand_paths(input_paths, exts):
+    """
+    パスリストを展開する。
+    - ファイル → そのまま追加（対象外拡張子はスキップ）
+    - フォルダ → 再帰的に対象ファイルを収集（階層制限なし）
+    戻り値: Path のリスト（重複除去・ソート済み）
+    """
+    seen   = set()
+    result = []
+    for raw in input_paths:
+        p = Path(raw)
+        if p.is_dir():
+            for ext in exts:
+                for found in sorted(p.rglob(f"*{ext}")):
+                    key = found.resolve()
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(found)
+        elif p.is_file():
+            if p.suffix.lower() in exts:
+                key = p.resolve()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(p)
+    return result
+
+
+def _checker_write_pdf_report(pdf_reports, out_path):
+    """
+    PDF チェック結果を 1 つの Word 文書にまとめて出力する。
+    pdf_reports: [(filename, [{"ページ", "NGワード", "修正案", "修正理由", "周辺の文章"}, ...]), ...]
+    """
+    from datetime import datetime
+    from docx.oxml.ns import qn as _qn
+    from docx.oxml   import OxmlElement as _Elem
+
+    doc = Document()
+
+    # ── 既定フォントを游明朝に統一 ───────────────────────────────
+    style = doc.styles['Normal']
+    style.font.name = 'ＭＳ 明朝'
+    style.font.size = DocxPt(10.5)
+
+    # ── タイトル ──────────────────────────────────────────────────
+    title_p = doc.add_heading('PDF 統一語句チェック結果', level=0)
+    title_p.alignment = 1  # CENTER
+    for run in title_p.runs:
+        run.font.name = 'ＭＳ 明朝'
+
+    date_str = datetime.now().strftime('%Y年%m月%d日  %H:%M')
+    info_p = doc.add_paragraph(f'作成日時: {date_str}')
+    info_p.alignment = 1
+    doc.add_paragraph()
+
+    # ── 各 PDF のセクション ───────────────────────────────────────
+    for fname, report in pdf_reports:
+        # ファイル名見出し（H1）
+        h = doc.add_heading(fname, level=1)
+        for run in h.runs:
+            run.font.name = 'ＭＳ 明朝'
+
+        if not report:
+            ok_p = doc.add_paragraph('　✓  修正箇所なし（統一ルールに準拠しています）')
+            if ok_p.runs:
+                ok_p.runs[0].font.color.rgb = DocxRGBColor(0, 128, 0)
+            doc.add_paragraph()
+            continue
+
+        # 指摘件数
+        cnt_p = doc.add_paragraph(f'　⚠  {len(report)} 箇所に修正を推奨します')
+        if cnt_p.runs:
+            cnt_p.runs[0].font.color.rgb = DocxRGBColor(200, 80, 0)
+
+        # テーブル
+        table = doc.add_table(rows=1, cols=5)
+        table.style = 'Table Grid'
+        tbl_hdr = table.rows[0].cells
+        for i, hdr_txt in enumerate(
+                ['ページ', 'NGワード', '修正案', '修正理由', '周辺の文章']):
+            tbl_hdr[i].text = hdr_txt
+            run = tbl_hdr[i].paragraphs[0].runs[0]
+            run.font.bold = True
+            run.font.name = 'ＭＳ 明朝'
+            # ヘッダー背景色（薄いグレー）
+            tc_pr = tbl_hdr[i]._tc.get_or_add_tcPr()
+            shd   = _Elem('w:shd')
+            shd.set(_qn('w:val'),  'clear')
+            shd.set(_qn('w:color'), 'auto')
+            shd.set(_qn('w:fill'), 'D9D9D9')
+            tc_pr.append(shd)
+
+        for r in report:
+            row = table.add_row().cells
+            row[0].text = str(r['ページ'])
+            row[1].text = r['NGワード']
+            row[2].text = r['修正案']
+            row[3].text = r['修正理由']
+            row[4].text = r['周辺の文章']
+            for cell in row:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        run.font.name = 'ＭＳ 明朝'
+                        run.font.size = DocxPt(9)
+
+        doc.add_paragraph()
+
+    doc.save(str(out_path))
+
+
+# ════════════════════════════════════════════════════════════════
+#  統一語句ルール編集ダイアログ
+# ════════════════════════════════════════════════════════════════
+
+class RulesEditorDialog(tk.Toplevel):
+    """統一語句ルールを GUIで追加・編集・削除して CSV へ保存するダイアログ"""
+
+    def __init__(self, parent, rules: dict, save_path: Path, on_saved):
+        super().__init__(parent)
+        self.title("統一語句ルール編集")
+        self.configure(bg=C["bg"])
+        self.geometry("640x540")
+        self.minsize(500, 400)
+        self.resizable(True, True)
+        self._save_path = save_path
+        self._on_saved  = on_saved
+        self._row_data  = []   # list of (wrong_var, right_var, frame)
+        self._build()
+        self._load_rules(rules)
+        self.grab_set()         # モーダル
+
+    # ── UI構築 ────────────────────────────────────────────────────
+
+    def _build(self):
+        # ヘッダー
+        hdr = tk.Frame(self, bg=C["surface"], padx=16, pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="⚓  統一語句ルール編集",
+                 font=("Helvetica", 13, "bold"),
+                 bg=C["surface"], fg=C["text"]).pack(side=tk.LEFT)
+        tk.Label(hdr,
+                 text="（NGワード → 統一語句）を自由に追加・修正・削除できます",
+                 font=("Helvetica", 9), bg=C["surface"], fg=C["sub"]
+                 ).pack(side=tk.LEFT, padx=12)
+
+        # 列ヘッダー
+        col_hdr = tk.Frame(self, bg=C["accent"])
+        col_hdr.pack(fill=tk.X, padx=16, pady=(10, 0))
+        tk.Label(col_hdr, text="  削除", width=5,
+                 font=("Helvetica", 8, "bold"),
+                 bg=C["accent"], fg=C["sub"]).grid(row=0, column=0, padx=(4, 2), pady=4)
+        tk.Label(col_hdr, text="NGワード（修正前）",
+                 font=("Helvetica", 9, "bold"),
+                 bg=C["accent"], fg=C["text"]).grid(row=0, column=1, padx=4, pady=4, sticky="w")
+        tk.Label(col_hdr, text="→",
+                 font=("Helvetica", 9), bg=C["accent"], fg=C["sub"]
+                 ).grid(row=0, column=2, padx=2)
+        tk.Label(col_hdr, text="統一語句（修正後）",
+                 font=("Helvetica", 9, "bold"),
+                 bg=C["accent"], fg=C["text"]).grid(row=0, column=3, padx=4, pady=4, sticky="w")
+        col_hdr.columnconfigure(1, weight=1)
+        col_hdr.columnconfigure(3, weight=1)
+
+        # スクロール可能な行エリア
+        scroll_wrap = tk.Frame(self, bg=C["bg"])
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 0))
+        canvas = tk.Canvas(scroll_wrap, bg=C["bg"], highlightthickness=0)
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._rows_frame = tk.Frame(canvas, bg=C["bg"])
+        fid = canvas.create_window((0, 0), window=self._rows_frame, anchor="nw")
+        self._rows_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(fid, width=e.width))
+        # マウスホイールスクロール
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+        self._canvas = canvas
+
+        # ボタン行
+        btn_row = tk.Frame(self, bg=C["bg"])
+        btn_row.pack(fill=tk.X, padx=16, pady=10)
+        FlatButton(btn_row, text="＋ 行を追加",
+                   command=lambda: self._add_row("", ""),
+                   bg=C["accent"], fg=C["text"],
+                   font=("Helvetica", 9)
+                   ).pack(side=tk.LEFT)
+        FlatButton(btn_row, text="✕ 閉じる",
+                   command=self.destroy,
+                   bg=C["accent"], fg=C["text"],
+                   font=("Helvetica", 9)
+                   ).pack(side=tk.RIGHT, padx=(8, 0))
+        FlatButton(btn_row, text="💾 保存して閉じる",
+                   command=self._save,
+                   bg=C["ok"], fg=C["bg"],
+                   font=("Helvetica", 10), bold=True
+                   ).pack(side=tk.RIGHT)
+
+    # ── データ操作 ────────────────────────────────────────────────
+
+    def _load_rules(self, rules: dict):
+        for wrong, right in rules.items():
+            self._add_row(wrong, right)
+
+    def _add_row(self, wrong: str = "", right: str = ""):
+        rf = tk.Frame(self._rows_frame, bg=C["surface"], pady=2)
+        rf.pack(fill=tk.X, pady=1, padx=2)
+
+        wrong_var = tk.StringVar(value=wrong)
+        right_var = tk.StringVar(value=right)
+
+        # 削除ボタン
+        def _delete(frame=rf, wv=wrong_var, rv=right_var):
+            frame.destroy()
+            self._row_data = [(w, r, f) for w, r, f in self._row_data
+                              if f is not frame]
+
+        FlatButton(rf, text="✕", command=_delete,
+                   bg=C["err"], fg=C["text"],
+                   font=("Helvetica", 8), padx=5, pady=2
+                   ).pack(side=tk.LEFT, padx=(4, 4))
+
+        # NGワード 入力
+        tk.Entry(rf, textvariable=wrong_var, width=20,
+                 bg=C["input_bg"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief=tk.FLAT, font=("Helvetica", 10)
+                 ).pack(side=tk.LEFT, padx=(0, 4), ipady=4, fill=tk.X, expand=True)
+
+        tk.Label(rf, text="→", bg=C["surface"], fg=C["sub"],
+                 font=("Helvetica", 10)).pack(side=tk.LEFT)
+
+        # 統一語句 入力
+        tk.Entry(rf, textvariable=right_var, width=20,
+                 bg=C["input_bg"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief=tk.FLAT, font=("Helvetica", 10)
+                 ).pack(side=tk.LEFT, padx=(4, 8), ipady=4, fill=tk.X, expand=True)
+
+        self._row_data.append((wrong_var, right_var, rf))
+
+    def _save(self):
+        # 生きている行だけ収集
+        rows = []
+        for wrong_var, right_var, rf in self._row_data:
+            try:
+                if not rf.winfo_exists():
+                    continue
+            except tk.TclError:
+                continue
+            w = wrong_var.get().strip()
+            r = right_var.get().strip()
+            if w:
+                rows.append((w, r or w))
+
+        if not rows:
+            messagebox.showwarning("空のルール",
+                                   "1件以上ルールを入力してください。",
+                                   parent=self)
+            return
+
+        try:
+            with open(self._save_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["類義語", "統一語句"])
+                for w, r in rows:
+                    writer.writerow([w, r])
+            messagebox.showinfo("保存完了",
+                                f"{len(rows)} 件のルールを保存しました。\n{self._save_path.name}",
+                                parent=self)
+            self._on_saved(self._save_path)
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("保存エラー", str(e), parent=self)
+
+
+# ════════════════════════════════════════════════════════════════
+#  統一ルール修正チェッカー 画面
+# ════════════════════════════════════════════════════════════════
+
+class CheckerFrame(LoggedFrame):
+
+    COLOR_MAP = {
+        "赤": (255, 0, 0),
+        "青": (0, 0, 255),
+        "緑": (0, 128, 0),
+        "黒": (0, 0, 0),
+    }
+    CHECKER_EXTS = {".docx", ".xlsx", ".pptx", ".pdf"}
+
+    def __init__(self, parent, on_back, on_go_pdf, on_go_link):
+        super().__init__(parent, bg=C["bg"])
+        self.on_back    = on_back
+        self.on_go_pdf  = on_go_pdf
+        self.on_go_link = on_go_link
+        self._cancel_flag  = threading.Event()
+        self._rules        = {}
+        self._rules_path   = None   # 現在読み込み中の CSV パス
+        self._build()
+        self._try_load_default_rules()
+
+    def _build(self):
+        build_header(self, "⚓  統一ルール修正チェッカー",
+                     "Word / Excel / PowerPoint / PDF の統一ルール適用")
+        nav = tk.Frame(self, bg=C["bg"])
+        nav.pack(fill=tk.X, padx=16, pady=(8, 0))
+        nav_button(nav, "← ホームへ戻る",   self.on_back).pack(side=tk.LEFT)
+        nav_button(nav, "PDF変換へ →",       self.on_go_pdf).pack(side=tk.RIGHT)
+        nav_button(nav, "リンク設定へ →",    self.on_go_link).pack(side=tk.RIGHT, padx=(0, 6))
+
+        _, main = make_scrollable_frame(self)
+        pad = dict(padx=16, pady=(0, 10))
+
+        # ── 入力ファイル DropZone ─────────────────────────────────
+        self.src_zone = DropZone(
+            main, "チェック対象ファイル",
+            "Word(.docx) / Excel(.xlsx) / PowerPoint(.pptx) / PDF をドロップ",
+            select_mode="file", allow_multiple=True,
+            count_extensions=self.CHECKER_EXTS
+        )
+        self.src_zone.pack(fill=tk.X, **pad)
+
+        # ── 出力先 DropZone ───────────────────────────────────────
+        self.out_zone = DropZone(
+            main, "出力先フォルダ（省略時：元ファイルと同じ場所）",
+            "フォルダをドロップ、または空のまま実行",
+            select_mode="folder", allow_multiple=False,
+            count_extensions=set()
+        )
+        self.out_zone.pack(fill=tk.X, **pad)
+
+        # ── ルールCSV 選択・編集行 ────────────────────────────────
+        section_divider(main)
+        rules_row = tk.Frame(main, bg=C["bg"])
+        rules_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+        tk.Label(rules_row, text="ルール CSV :",
+                 font=("Helvetica", 10), bg=C["bg"], fg=C["sub"]
+                 ).pack(side=tk.LEFT)
+        self.rules_label = tk.Label(
+            rules_row, text="（読み込み中…）",
+            font=("Helvetica", 9), bg=C["bg"], fg=C["info"],
+            wraplength=300, anchor="w"
+        )
+        self.rules_label.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        FlatButton(rules_row, text="✏ 編集",
+                   command=self._open_rules_editor,
+                   bg=C["ok"], fg=C["bg"],
+                   font=("Helvetica", 9), bold=True
+                   ).pack(side=tk.RIGHT)
+        FlatButton(rules_row, text="CSV を選択",
+                   command=self._pick_rules_csv,
+                   bg=C["accent"], fg=C["text"],
+                   font=("Helvetica", 9)
+                   ).pack(side=tk.RIGHT, padx=(0, 6))
+        FlatButton(rules_row, text="リセット",
+                   command=self._try_load_default_rules,
+                   bg=C["accent"], fg=C["text"],
+                   font=("Helvetica", 9)
+                   ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        # ── 修正箇所の色 ──────────────────────────────────────────
+        color_row = tk.Frame(main, bg=C["bg"])
+        color_row.pack(fill=tk.X, padx=16, pady=(0, 6))
+        tk.Label(color_row, text="修正箇所の色 :",
+                 font=("Helvetica", 10), bg=C["bg"], fg=C["sub"]
+                 ).pack(side=tk.LEFT)
+        self._color_var = tk.StringVar(value="赤")
+        for color_name in self.COLOR_MAP:
+            tk.Radiobutton(
+                color_row, text=color_name,
+                variable=self._color_var, value=color_name,
+                bg=C["bg"], fg=C["text"],
+                selectcolor=C["accent"],
+                activebackground=C["bg"], activeforeground=C["text"],
+                font=("Helvetica", 10)
+            ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # ── ハイパーリンク保護オプション ──────────────────────────
+        link_row = tk.Frame(main, bg=C["bg"])
+        link_row.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self._protect_links_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            link_row,
+            text="ハイパーリンクを保護する（リンク文字列は修正しない）",
+            variable=self._protect_links_var,
+            bg=C["bg"], fg=C["sub"],
+            selectcolor=C["accent"],
+            activebackground=C["bg"], activeforeground=C["text"],
+            font=("Helvetica", 9)
+        ).pack(side=tk.LEFT)
+
+        # ── 実行・キャンセルボタン ────────────────────────────────
+        section_divider(main)
+        btn_row = tk.Frame(main, bg=C["bg"])
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 10))
+        self.run_btn = FlatButton(
+            btn_row, text="▶  修正チェックを開始",
+            command=self._start,
+            bg=C["primary"], fg=C["text"],
+            font=("Helvetica", 11), bold=True
+        )
+        self.run_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.cancel_btn = FlatButton(
+            btn_row, text="■  キャンセル",
+            command=self._cancel,
+            bg=C["accent"], fg=C["text"],
+            font=("Helvetica", 9), state=tk.DISABLED
+        )
+        self.cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # ── ログ ──────────────────────────────────────────────────
+        self.log_txt = make_log_widget(main)
+
+    # ── rules.csv ────────────────────────────────────────────────
+
+    def _try_load_default_rules(self):
+        """スクリプトと同じフォルダの rules.csv を自動読み込み。
+        PyInstaller バンドル時は sys._MEIPASS を参照する。"""
+        if getattr(sys, 'frozen', False):
+            base = Path(sys._MEIPASS)   # PyInstaller 展開先
+        else:
+            base = Path(__file__).parent
+        default = base / "rules.csv"
+        if default.exists():
+            self._load_rules_from(default)
+        else:
+            self._rules      = {}
+            self._rules_path = None
+            self.rules_label.configure(
+                text="（rules.csv 未検出 — CSV を手動で選択してください）",
+                fg=C["warn"])
+
+    def _pick_rules_csv(self):
+        path = filedialog.askopenfilename(
+            title="ルール CSV を選択",
+            filetypes=[("CSV ファイル", "*.csv"), ("すべて", "*.*")]
+        )
+        if path:
+            self._load_rules_from(Path(path))
+
+    def _load_rules_from(self, path: Path):
+        rules = _checker_load_rules(path)
+        if rules:
+            self._rules      = rules
+            self._rules_path = path
+            self.rules_label.configure(
+                text=f"{path.name}  ({len(rules)} ルール読み込み済み)",
+                fg=C["ok"])
+            self._log(f"ルール読み込み完了: {path.name}  ({len(rules)} 件)", "success")
+        else:
+            self._rules      = {}
+            self._rules_path = path   # パスは覚えておく（新規編集できるように）
+            self.rules_label.configure(
+                text=f"読み込み失敗: {path.name}", fg=C["err"])
+            self._log(f"ルール CSV の読み込みに失敗しました: {path}", "error")
+
+    def _open_rules_editor(self):
+        """統一語句ルール編集ダイアログを開く"""
+        # 保存先パスを決定（未選択なら rules.csv をデフォルト）
+        save_path = self._rules_path or (Path(__file__).parent / "rules.csv")
+        RulesEditorDialog(
+            parent=self,
+            rules=self._rules,
+            save_path=save_path,
+            on_saved=lambda p: self._load_rules_from(p)
+        )
+
+    # ── 処理制御 ──────────────────────────────────────────────────
+
+    def _start(self):
+        paths = self.src_zone.selected_paths
+        if not paths:
+            messagebox.showwarning("ファイル未指定",
+                                   "チェック対象ファイルを指定してください。")
+            return
+        if not self._rules:
+            messagebox.showwarning("ルール未設定",
+                                   "ルール CSV が読み込まれていません。\n"
+                                   "CSV を選択してください。")
+            return
+        out_paths     = self.out_zone.selected_paths
+        out_dir       = Path(out_paths[0]) if out_paths else None
+        rgb           = self.COLOR_MAP[self._color_var.get()]
+        protect_links = self._protect_links_var.get()
+        self._cancel_flag.clear()
+        self.run_btn.configure(text="処理中…", state=tk.DISABLED)
+        self.cancel_btn.configure(state=tk.NORMAL)
+        threading.Thread(
+            target=self._run_worker,
+            args=(paths, out_dir, rgb, protect_links),
+            daemon=True
+        ).start()
+
+    def _cancel(self):
+        self._cancel_flag.set()
+        self._log("キャンセルを要求しました…", "warning")
+
+    def _run_worker(self, paths, out_dir, rgb, protect_links):
+        ok = err = skip = 0
+        pdf_reports = []       # [(filename, report_list), ...]
+        all_pdf_srcs = []      # PDF ソースパス（レポート保存先フォールバック用）
+
+        try:
+            # ── 入力パスをグループ化 ─────────────────────────────────
+            # groups: [ (root_or_None, [Path, ...]) ]
+            #   root_or_None … D&D したフォルダ、または None（単体ファイル）
+            groups = []
+            seen   = set()
+            for raw in paths:
+                p = Path(raw)
+                if p.is_dir():
+                    group_files = []
+                    for ext in self.CHECKER_EXTS:
+                        for found in sorted(p.rglob(f"*{ext}")):
+                            key = found.resolve()
+                            if key not in seen:
+                                seen.add(key)
+                                group_files.append(found)
+                    group_files.sort()
+                    if group_files:
+                        groups.append((p, group_files))
+                elif p.is_file():
+                    if p.suffix.lower() in self.CHECKER_EXTS:
+                        key = p.resolve()
+                        if key not in seen:
+                            seen.add(key)
+                            groups.append((None, [p]))
+
+            total_files = sum(len(g[1]) for g in groups)
+            if not total_files:
+                self._log("対象ファイルが見つかりませんでした。", "warning")
+                return
+
+            self._log(f"処理対象: {total_files} ファイル", "info")
+
+            # ── グループ単位で処理 ──────────────────────────────────
+            for root, files in groups:
+                if self._cancel_flag.is_set():
+                    self._log("⚠ キャンセルされました。", "warning")
+                    break
+
+                is_folder = (root is not None)
+                if is_folder:
+                    # フォルダグループの出力ベース
+                    base_out = out_dir if out_dir else (
+                        root.parent / (root.name + "_チェック済"))
+                    self._log(f"── フォルダ: {root.name} ({len(files)} ファイル)", "info")
+
+                # group_results: [(src, dest, result)]
+                #   result: True=修正あり, False=修正なし, None=PDF, "error"=エラー
+                group_results    = []
+                group_has_change = False   # Office ファイルに修正があったか
+
+                for src in files:
+                    if self._cancel_flag.is_set():
+                        break
+
+                    ext = src.suffix.lower()
+
+                    # ── 出力先パスの決定 ──────────────────────────
+                    if is_folder:
+                        # フォルダ階層を保持: base_out / フォルダ名 / 相対パス
+                        rel  = src.relative_to(root)
+                        dest = base_out / root.name / rel
+                    elif out_dir:
+                        dest = out_dir / src.name
+                    else:
+                        dest = src.parent / src.name
+
+                    # 単体ファイルの同一パスコンフリクト回避
+                    if not is_folder and dest.resolve() == src.resolve():
+                        counter = 1
+                        while dest.resolve() == src.resolve() or dest.exists():
+                            dest = dest.parent / f"{src.stem}({counter}){src.suffix}"
+                            counter += 1
+
+                    # ── ファイル種別ごとの処理 ───────────────────
+                    if ext == ".pdf":
+                        if not _PDFPLUMBER_OK:
+                            self._log(
+                                "  ✗ pdfplumber 未インストール（pip install pdfplumber）",
+                                "error")
+                            group_results.append((src, dest, "error"))
+                            continue
+                        self._log(f"PDF チェック中: {src.name}", "info")
+                        try:
+                            report = _checker_check_pdf(src, self._rules)
+                            pdf_reports.append((src.name, report))
+                            all_pdf_srcs.append(src)
+                            if report:
+                                self._log(f"  ⚠ {len(report)} 箇所で修正を推奨", "warning")
+                            else:
+                                self._log("  ✓ 問題なし", "success")
+                            group_results.append((src, dest, None))   # None = PDF
+                        except Exception as e:
+                            self._log(f"  ✗ エラー: {e}", "error")
+                            group_results.append((src, dest, "error"))
+
+                    else:
+                        # Word / Excel / PPT
+                        self._log(f"処理中: {src.name}", "info")
+                        try:
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            if ext == ".docx":
+                                modified = _checker_repair_docx(
+                                    src, self._rules, rgb, dest,
+                                    protect_links=protect_links)
+                            elif ext == ".xlsx":
+                                if not _OPENPYXL_OK:
+                                    raise RuntimeError(
+                                        "openpyxl 未インストール（pip install openpyxl）")
+                                modified = _checker_repair_xlsx(
+                                    src, self._rules, rgb, dest,
+                                    protect_links=protect_links)
+                            elif ext == ".pptx":
+                                if not _PPTX_OK:
+                                    raise RuntimeError(
+                                        "python-pptx 未インストール（pip install python-pptx）")
+                                modified = _checker_repair_pptx(
+                                    src, self._rules, rgb, dest,
+                                    protect_links=protect_links)
+                            else:
+                                modified = False
+                            group_results.append((src, dest, modified))
+                            if modified:
+                                group_has_change = True
+                        except Exception as e:
+                            self._log(f"  ✗ エラー: {e}", "error")
+                            group_results.append((src, dest, "error"))
+
+                # ── グループ後処理（カウント & ファイル出力） ──────
+                if is_folder and not group_has_change:
+                    # フォルダ内に Office 修正なし → 全スキップ
+                    for src, dest, result in group_results:
+                        if result == "error":
+                            err += 1
+                        else:
+                            # 修正ありとして保存されたファイルがあれば削除
+                            if dest.exists():
+                                try:
+                                    dest.unlink()
+                                except Exception:
+                                    pass
+                            skip += 1
+                    self._log(
+                        f"  フォルダ「{root.name}」: 修正箇所なし"
+                        f"（{len(group_results)} ファイルをスキップ）",
+                        "success")
+                else:
+                    for src, dest, result in group_results:
+                        if result == "error":
+                            err += 1
+
+                        elif result is None:
+                            # PDF ファイル
+                            if is_folder and group_has_change:
+                                # フォルダに修正あり → PDF も出力
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(src), str(dest))
+                                self._log(
+                                    f"  ✓ 出力（PDF）: {src.name}", "success")
+                            ok += 1   # チェック済みとしてカウント
+
+                        elif result is True:
+                            # 修正あり
+                            self._log(
+                                f"  ✓ 出力（修正あり）: {src.name}", "success")
+                            ok += 1
+
+                        else:
+                            # result is False → 修正なし
+                            if dest.exists():
+                                try:
+                                    dest.unlink()
+                                except Exception:
+                                    pass
+                            if is_folder:
+                                # フォルダに修正あり → 元ファイルを出力
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(src), str(dest))
+                                self._log(
+                                    f"  ✓ 出力（修正なし）: {src.name}", "success")
+                                ok += 1
+                            else:
+                                # 単体ファイル → スキップ
+                                self._log(
+                                    f"  ✓ 修正箇所なし（出力スキップ）: {src.name}",
+                                    "success")
+                                skip += 1
+
+            # ── PDF 結果を Word にまとめて出力 ────────────────────
+            # ※ out_dir 直下に単体で保存（フォルダ階層の外）
+            if pdf_reports:
+                self._log("─" * 50, "")
+                self._log("【PDF チェック結果】", "info")
+                total_issues = 0
+                for fname, report in pdf_reports:
+                    self._log(
+                        f"  {fname}: {len(report)} 件",
+                        "warning" if report else "success")
+                    total_issues += len(report)
+
+                if total_issues == 0:
+                    self._log(
+                        "  ✓ すべての PDF に修正箇所なし（レポート出力スキップ）",
+                        "success")
+                else:
+                    # Word レポートは out_dir 直下（フォルダ階層の外側）
+                    if out_dir:
+                        report_dir = out_dir
+                    elif all_pdf_srcs:
+                        report_dir = all_pdf_srcs[0].parent
+                    else:
+                        report_dir = Path.cwd()
+                    report_dir.mkdir(parents=True, exist_ok=True)
+
+                    report_path = report_dir / "PDF_統一語句チェック結果.docx"
+                    counter = 1
+                    while report_path.exists():
+                        report_path = (
+                            report_dir / f"PDF_統一語句チェック結果({counter}).docx")
+                        counter += 1
+
+                    try:
+                        _checker_write_pdf_report(pdf_reports, report_path)
+                        self._log(
+                            f"  ✓ Word レポート保存: {report_path.name}  "
+                            f"（全 {len(pdf_reports)} PDF / 指摘 {total_issues} 件）",
+                            "success")
+                    except Exception as e:
+                        self._log(f"  ✗ Word レポート保存エラー: {e}", "error")
+
+                self._log("─" * 50, "")
+
+            self._log(
+                f"完了: {ok} 件成功  {err} 件エラー  {skip} 件スキップ",
+                "success" if err == 0 else "warning")
+        except Exception as e:
+            self._log(f"予期しないエラー: {e}", "error")
+        finally:
+            self.after(0, self._reset_btns)
+
+    def _reset_btns(self):
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self.run_btn.configure(text="▶  修正チェックを開始", state=tk.NORMAL)
+
+    def _log(self, msg, tag=""):
+        self.after(0, lambda m=msg, t=tag: log_write(self.log_txt, m, t))
+
+
+# ════════════════════════════════════════════════════════════════
 #  メインアプリ（画面切り替えコントローラ）
 # ════════════════════════════════════════════════════════════════
 
@@ -1614,13 +2779,18 @@ class RakurakuJC:
         self.root.minsize(560, 680)
         self.root.configure(bg=C["bg"])
 
+        self._current = None
+        self._show_launcher()
+
+        # 描画を確定させてからウィンドウを前面に出す
+        self.root.update_idletasks()
+        self.root.update()
+
         if platform.system() == "Darwin":
             self.root.lift()
             self.root.attributes("-topmost", True)
-            self.root.after(100, lambda: self.root.attributes("-topmost", False))
-
-        self._current = None
-        self._show_launcher()
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+            self.root.after(300, lambda: self.root.focus_force())
 
     def check_update(self):
         def _do():
@@ -1647,7 +2817,12 @@ class RakurakuJC:
 
     def _show_launcher(self):
         self._clear()
-        f = LauncherFrame(self.root, on_link=self._show_link, on_pdf=self._show_pdf)
+        f = LauncherFrame(
+            self.root,
+            on_link=self._show_link,
+            on_pdf=self._show_pdf,
+            on_checker=self._show_checker
+        )
         f.pack(fill=tk.BOTH, expand=True)
         self._current = f
 
@@ -1657,6 +2832,7 @@ class RakurakuJC:
             self.root,
             on_back=self._show_launcher,
             on_go_pdf=self._show_pdf,
+            on_go_checker=self._show_checker,
             dnd_ok=(_DND_BACKEND == "tkdnd"),
             on_check_update=self.check_update
         )
@@ -1668,6 +2844,18 @@ class RakurakuJC:
         f = PdfFrame(
             self.root,
             on_back=self._show_launcher,
+            on_go_link=self._show_link,
+            on_go_checker=self._show_checker
+        )
+        f.pack(fill=tk.BOTH, expand=True)
+        self._current = f
+
+    def _show_checker(self):
+        self._clear()
+        f = CheckerFrame(
+            self.root,
+            on_back=self._show_launcher,
+            on_go_pdf=self._show_pdf,
             on_go_link=self._show_link
         )
         f.pack(fill=tk.BOTH, expand=True)

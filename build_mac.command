@@ -16,15 +16,14 @@ echo ""
 # ── [1/6] 依存パッケージ確認 ─────────────────────────────────────
 echo "[ 1/6 ] 依存パッケージを確認中..."
 
-python3 -c "import docx" 2>/dev/null || {
-    echo "  → python-docx をインストール中..."
-    pip3 install python-docx --break-system-packages -q 2>/dev/null || \
-    pip3 install python-docx -q
-}
-python3 -c "import PyInstaller" 2>/dev/null || {
-    echo "  → PyInstaller をインストール中..."
-    pip3 install pyinstaller -q
-}
+_pip() { pip3 install "$1" --break-system-packages -q 2>/dev/null || pip3 install "$1" -q; }
+
+python3 -c "import docx"        2>/dev/null || { echo "  → python-docx をインストール中...";  _pip python-docx;   }
+python3 -c "import openpyxl"    2>/dev/null || { echo "  → openpyxl をインストール中...";      _pip openpyxl;      }
+python3 -c "from pptx import Presentation" 2>/dev/null || { echo "  → python-pptx をインストール中..."; _pip python-pptx; }
+python3 -c "import pdfplumber"  2>/dev/null || { echo "  → pdfplumber をインストール中...";    _pip pdfplumber;    }
+python3 -c "import tkinterdnd2" 2>/dev/null || { echo "  → tkinterdnd2 をインストール中...";   _pip tkinterdnd2;   }
+python3 -c "import PyInstaller" 2>/dev/null || { echo "  → PyInstaller をインストール中...";   _pip pyinstaller;   }
 echo "  ✓ 依存パッケージ OK"
 echo ""
 

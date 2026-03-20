@@ -4,17 +4,41 @@
 #  実行: pyinstaller 楽々JC_Windows.spec
 # ════════════════════════════════════════
 
+from PyInstaller.utils.hooks import collect_all
+
+# tkinterdnd2 はバイナリが必要なため collect_all で丸ごと取り込む
+dnd_datas, dnd_binaries, dnd_hiddenimports = collect_all('tkinterdnd2')
+
 a = Analysis(
     ['linkforge.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=dnd_binaries,
+    datas=[
+        ('rules.csv', '.'),   # デフォルトルールを同梱
+        *dnd_datas,
+    ],
     hiddenimports=[
+        # python-docx
         'docx',
         'docx.oxml',
         'docx.oxml.ns',
         'lxml',
         'lxml._elementpath',
+        # openpyxl
+        'openpyxl',
+        'openpyxl.styles',
+        'openpyxl.styles.fonts',
+        # python-pptx
+        'pptx',
+        'pptx.dml.color',
+        'pptx.util',
+        # pdfplumber
+        'pdfplumber',
+        'pdfminer',
+        'pdfminer.high_level',
+        'pdfminer.layout',
+        # tkinterdnd2
+        *dnd_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},

@@ -17,7 +17,22 @@ python -c "import docx" 2>nul || (
     echo   python-docx をインストール中...
     pip install python-docx -q
 )
-
+python -c "import openpyxl" 2>nul || (
+    echo   openpyxl をインストール中...
+    pip install openpyxl -q
+)
+python -c "from pptx import Presentation" 2>nul || (
+    echo   python-pptx をインストール中...
+    pip install python-pptx -q
+)
+python -c "import pdfplumber" 2>nul || (
+    echo   pdfplumber をインストール中...
+    pip install pdfplumber -q
+)
+python -c "import tkinterdnd2" 2>nul || (
+    echo   tkinterdnd2 をインストール中...
+    pip install tkinterdnd2 -q
+)
 python -c "import PyInstaller" 2>nul || (
     echo   PyInstaller をインストール中...
     pip install pyinstaller -q
