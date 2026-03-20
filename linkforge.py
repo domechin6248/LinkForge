@@ -889,9 +889,18 @@ def _mac_word(abs_in: str, abs_out: str):
         return None, "Microsoft Word 未インストール"
     script = f'''
 tell application "Microsoft Word"
-    set theDoc to open POSIX file "{_esc_as(abs_in)}"
-    save as theDoc file name "{_esc_as(abs_out)}" file format format PDF
-    close theDoc saving no
+    try
+        open POSIX file "{_esc_as(abs_in)}"
+        delay 2
+        try
+            save as (active document) file name "{_esc_as(abs_out)}" file format format PDF
+        end try
+        close (active document) saving no
+    on error errMsg
+        try
+            close (active document) saving no
+        end try
+    end try
 end tell
 '''
     rc, err = _run_applescript(script)
@@ -907,10 +916,20 @@ def _mac_excel(abs_in: str, abs_out: str):
         return None, "Microsoft Excel 未インストール"
     script = f'''
 tell application "Microsoft Excel"
-    open POSIX file "{_esc_as(abs_in)}"
-    set theWb to active workbook
-    save workbook as theWb filename "{_esc_as(abs_out)}" file format PDF file format
-    close theWb saving no
+    try
+        open POSIX file "{_esc_as(abs_in)}"
+        delay 2
+        try
+            tell active workbook
+                save as filename "{_esc_as(abs_out)}" file format PDF file format
+            end tell
+        end try
+        close (active workbook) saving no
+    on error errMsg
+        try
+            close (active workbook) saving no
+        end try
+    end try
 end tell
 '''
     rc, err = _run_applescript(script)
@@ -926,10 +945,18 @@ def _mac_ppt(abs_in: str, abs_out: str):
         return None, "Microsoft PowerPoint 未インストール"
     script = f'''
 tell application "Microsoft PowerPoint"
-    open POSIX file "{_esc_as(abs_in)}"
-    set thePrs to active presentation
-    save thePrs in "{_esc_as(abs_out)}" as save as PDF
-    close thePrs
+    try
+        open POSIX file "{_esc_as(abs_in)}"
+        delay 2
+        try
+            save active presentation in "{_esc_as(abs_out)}" as save as PDF
+        end try
+        close active presentation saving no
+    on error errMsg
+        try
+            close active presentation saving no
+        end try
+    end try
 end tell
 '''
     rc, err = _run_applescript(script)
