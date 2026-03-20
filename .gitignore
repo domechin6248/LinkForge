@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# PyInstaller
+*.spec.bak
+
+# Zip releases
+*.zip

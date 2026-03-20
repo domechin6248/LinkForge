@@ -1,36 +1,50 @@
-name: Build RakurakuJC
+name: Build Windows EXE and Release
 
+# version.txt が更新されたときだけ自動ビルド＆リリース
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    paths:
+      - 'version.txt'
+    branches:
+      - main
 
 jobs:
-  build-mac:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install pyinstaller python-docx tkinterdnd2
-      - run: pyinstaller 楽々JC.spec --noconfirm
-      - run: cd dist && zip -r RakurakuJC_Mac.zip 楽々JC.app
-      - uses: actions/upload-artifact@v4
-        with:
-          name: RakurakuJC_Mac
-          path: dist/RakurakuJC_Mac.zip
-
   build-windows:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pyinstaller python-docx tkinterdnd2
-      - run: pyinstaller rakuraku_jc.py --noconfirm --onefile --windowed --name RakurakuJC
-      - uses: actions/upload-artifact@v4
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller python-docx openpyxl python-pptx pdfplumber tkinterdnd2
+
+      - name: Build EXE (CI spec)
+        run: pyinstaller build_ci.spec
+
+      - name: Get version from version.txt
+        id: ver
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Create GitHub Release and upload EXE
+        uses: softprops/action-gh-release@v2
         with:
-          name: RakurakuJC_Windows
-          path: dist/RakurakuJC.exe
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: "v${{ steps.ver.outputs.version }}"
+          body: |
+            楽々JC v${{ steps.ver.outputs.version }}
+
+            **Windows ユーザーの方へ**
+            アプリが自動でこのバージョンにアップデートされます。
+            アプリを起動して「はい」を押してください。
+          files: dist/rakuraku_jc.exe
+          make_latest: true

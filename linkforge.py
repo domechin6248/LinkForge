@@ -96,6 +96,11 @@ APP_VERSION  = "2.0.0"
 GITHUB_USER  = "domechin6248"
 GITHUB_REPO  = "LinkForge"
 GITHUB_RAW   = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main"
+# Windows .exe 配布用 (GitHub Releases の最新リリース)
+GITHUB_EXE_URL = (
+    f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}"
+    "/releases/latest/download/rakuraku_jc.exe"
+)
 
 HYPERLINK_TYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/"
@@ -565,6 +570,13 @@ def _to_file_uri(path: Path) -> str:
     else:
         encoded = urllib.parse.quote(abs_str, safe="/:")
         return "file://" + encoded
+
+def _to_relative_uri(rel: str) -> str:
+    """相対パスをWordハイパーリンク用URIに変換。
+    Mac/Windows両対応・フォルダ移動後も機能する。
+    例: '資料/file.pdf' → '資料/file.pdf' (スペース・日本語はURLエンコード)"""
+    parts = Path(rel).parts
+    return "/".join(urllib.parse.quote(p, safe="") for p in parts)
 
 def copy_link_trees(link_dirs, dst_parent):
     for link_dir in link_dirs:
@@ -1414,9 +1426,10 @@ class LinkFrame(LoggedFrame):
                     copy_link_trees(link_dirs, out)
                     self._log(f"    資料フォルダ {len(link_dirs)} 個をコピー完了")
 
-                    # ② 絶対 file:// URI マップを構築（クリック即開き保証）
+                    # ② 相対 URI マップを構築（Mac/Windows両対応・フォルダ移動後も有効）
                     #    fm の値は "FolderName/file.pdf" 形式 (out 直下からの相対)
-                    abs_fm = {key: _to_file_uri(out / rel)
+                    #    Wordファイルと同じ階層に資料フォルダがあるため相対パスで十分
+                    abs_fm = {key: _to_relative_uri(rel)
                               for key, rel in fm.items()}
 
                     # ③ Wordを開いてリンク挿入 → 保存
@@ -2792,23 +2805,140 @@ class RakurakuJC:
             self.root.after(200, lambda: self.root.attributes("-topmost", False))
             self.root.after(300, lambda: self.root.focus_force())
 
-    def check_update(self):
+        # 起動時にサイレントでアップデートを自動チェック
+        self._auto_check_update()
+
+    def check_update(self, silent=False):
+        """アップデートを確認する。
+        silent=True: 起動時の自動チェック（最新版なら何も表示しない）
+        silent=False: ボタン押下時（最新版でも表示する）
+        """
+        root = self.root
+
+        def _set_title(msg):
+            root.after(0, lambda: root.title(msg))
+
+        def _download_py(lv):
+            """Mac / Python 起動時: linkforge.py を上書き"""
+            try:
+                _set_title("楽々JC  ダウンロード中...")
+                py_url = GITHUB_RAW + "/linkforge.py"
+                with urllib.request.urlopen(py_url, timeout=60) as res:
+                    new_code = res.read()
+                current = Path(sys.argv[0]).resolve()
+                current.write_bytes(new_code)
+                _set_title(f"楽々JC  v{APP_VERSION}")
+                root.after(0, lambda: messagebox.showinfo(
+                    "更新完了",
+                    f"v{lv} にアップデートしました！\n"
+                    "アプリを一度終了して再起動してください。"))
+            except Exception as e:
+                _set_title(f"楽々JC  v{APP_VERSION}")
+                root.after(0, lambda: messagebox.showerror(
+                    "ダウンロード失敗", f"更新ファイルの取得に失敗しました:\n{e}"))
+
+        def _download_exe(lv):
+            """Windows .exe 起動時: 新 exe をダウンロードして VBScript で入れ替え"""
+            try:
+                old_exe = Path(sys.executable).resolve()
+                new_exe = old_exe.parent / "_rakuraku_new.exe"
+
+                # ダウンロード（タイトルバーで進捗表示）
+                _set_title("楽々JC  ダウンロード中... しばらくお待ちください")
+                with urllib.request.urlopen(GITHUB_EXE_URL, timeout=120) as res:
+                    total = int(res.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    chunk = 65536
+                    buf = bytearray()
+                    while True:
+                        data = res.read(chunk)
+                        if not data:
+                            break
+                        buf.extend(data)
+                        downloaded += len(data)
+                        if total:
+                            pct = int(downloaded / total * 100)
+                            _set_title(f"楽々JC  ダウンロード中... {pct}%")
+                    new_exe.write_bytes(bytes(buf))
+
+                # VBScript で入れ替え (完全ASCII: 日本語なし)
+                # 2秒待機→旧 exe 削除→新 exe をリネーム→起動→自己削除
+                vbs = (
+                    'WScript.Sleep 2000\r\n'
+                    'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+                    'old = WScript.Arguments(0)\r\n'
+                    'nw  = WScript.Arguments(1)\r\n'
+                    'fso.DeleteFile old, True\r\n'
+                    'fso.MoveFile nw, old\r\n'
+                    'CreateObject("WScript.Shell").Run Chr(34) & old & Chr(34)\r\n'
+                    'fso.DeleteFile WScript.ScriptFullName\r\n'
+                )
+                vbs_path = old_exe.parent / "_rakuraku_updater.vbs"
+                vbs_path.write_text(vbs, encoding='utf-8')
+
+                import subprocess
+                subprocess.Popen(
+                    ['wscript', str(vbs_path), str(old_exe), str(new_exe)],
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                sys.exit()
+
+            except Exception as e:
+                _set_title(f"楽々JC  v{APP_VERSION}")
+                root.after(0, lambda: messagebox.showerror(
+                    "ダウンロード失敗", f"更新に失敗しました:\n{e}"))
+
         def _do():
             try:
                 url = GITHUB_RAW + "/version.txt"
                 with urllib.request.urlopen(url, timeout=5) as res:
                     latest = res.read().decode().strip()
+
                 if latest == APP_VERSION:
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "アップデート確認", "最新バージョンです！\n現在: v" + APP_VERSION))
+                    if not silent:
+                        root.after(0, lambda: messagebox.showinfo(
+                            "アップデート確認", f"最新バージョンです！\n現在: v{APP_VERSION}"))
+                    return
+
+                lv = latest
+                is_frozen = getattr(sys, 'frozen', False)
+
+                if is_frozen and platform.system() == "Windows":
+                    # Windows .exe → exe を自動入れ替え
+                    def _ask_win():
+                        if messagebox.askyesno(
+                            "アップデートあり",
+                            f"新しいバージョンがあります！\n"
+                            f"現在: v{APP_VERSION}  →  最新: v{lv}\n\n"
+                            "今すぐ自動更新しますか？\n"
+                            "（ダウンロード後にアプリが自動で再起動します）"):
+                            threading.Thread(target=lambda: _download_exe(lv),
+                                             daemon=True).start()
+                    root.after(0, _ask_win)
+
                 else:
-                    lv = latest
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "アップデートあり",
-                        f"新しいバージョンがあります。\n現在: v{APP_VERSION}  最新: v{lv}"))
+                    # Mac / Python 起動時 → linkforge.py を上書き
+                    def _ask_py():
+                        if messagebox.askyesno(
+                            "アップデートあり",
+                            f"新しいバージョンがあります！\n"
+                            f"現在: v{APP_VERSION}  →  最新: v{lv}\n\n"
+                            "今すぐ自動更新しますか？\n"
+                            "（更新後にアプリを再起動してください）"):
+                            threading.Thread(target=lambda: _download_py(lv),
+                                             daemon=True).start()
+                    root.after(0, _ask_py)
+
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("エラー", str(e)))
+                if not silent:
+                    root.after(0, lambda: messagebox.showerror(
+                        "エラー", f"アップデート確認に失敗しました:\n{e}"))
+
         threading.Thread(target=_do, daemon=True).start()
+
+    def _auto_check_update(self):
+        """起動3秒後にサイレントでアップデートを確認する"""
+        self.root.after(3000, lambda: self.check_update(silent=True))
 
     def _clear(self):
         if self._current:
