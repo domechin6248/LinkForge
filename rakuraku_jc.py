@@ -521,16 +521,19 @@ def _get_libreoffice_path():
     return "soffice"
 
 def scan_pdf_targets(paths):
-    """フォルダ / ファイルのリストから変換対象を再帰収集"""
+    """フォルダ / ファイルのリストから変換対象を再帰収集
+    返り値: [(file_path, root_dir), ...]
+    """
     result = []
     for p in paths:
         p = Path(p)
         if p.is_dir():
+            root = p
             for f in sorted(p.rglob("*")):
                 if f.is_file() and f.suffix.lower() in PDF_EXTENSIONS:
-                    result.append(f)
+                    result.append((f, root))
         elif p.is_file() and p.suffix.lower() in PDF_EXTENSIONS:
-            result.append(p)
+            result.append((p, p.parent))
     return result
 
 def convert_to_pdf(input_path: Path, output_dir: Path, log_cb=None):
@@ -960,23 +963,23 @@ class PdfFrame(tk.Frame):
         self.on_back    = on_back
         self.on_go_link = on_go_link
         self._cancel_flag = threading.Event()
+        self._run_enabled    = False
+        self._cancel_enabled = False
         self._build()
 
     def _build(self):
         build_header(self, "📄  PDF一括変換",
                      "Word / Excel / PowerPoint / 画像 → PDF")
 
-        # ── ナビ行 ──
         nav = tk.Frame(self, bg=C["bg"])
         nav.pack(fill=tk.X, padx=16, pady=(8, 0))
         nav_button(nav, "← ホームへ戻る", self.on_back).pack(side=tk.LEFT)
         nav_button(nav, "リンク一括設定へ →", self.on_go_link).pack(side=tk.RIGHT)
 
-        # ── スクロールエリア ──
         _, main = make_scrollable_frame(self)
         pad = dict(padx=16, pady=(0, 10))
 
-        # ── DropZone（フォルダ / ファイル複数対応）──
+        # 変換対象
         self.src_zone = DropZone(
             main, "変換対象フォルダ / ファイル",
             "複数フォルダをドラッグ&ドロップ（サブフォルダも自動検索）",
@@ -985,56 +988,16 @@ class PdfFrame(tk.Frame):
         self.src_zone.pack(fill=tk.X, **pad)
         self.src_zone.on_change = self._update_count
 
-        # ── 出力先 ──
-        out_frame = tk.Frame(main, bg=C["surface"],
-                             highlightbackground=C["border"],
-                             highlightthickness=2)
-        out_frame.pack(fill=tk.X, **pad)
-        tk.Label(out_frame, text="▸ 出力先",
-                 font=("Helvetica", 12, "bold"),
-                 bg=C["surface"], fg=C["text"]
-                 ).pack(anchor="w", padx=14, pady=(10, 4))
-
-        mode_row = tk.Frame(out_frame, bg=C["surface"])
-        mode_row.pack(fill=tk.X, padx=14)
-        tk.Label(mode_row, text="保存先:",
-                 font=("Helvetica", 9), bg=C["surface"], fg=C["sub"]
-                 ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.out_mode = tk.StringVar(value="same")
-        for val, lbl in [("same", "元ファイルと同じフォルダ"), ("custom", "指定フォルダ")]:
-            tk.Radiobutton(
-                mode_row, text=lbl, variable=self.out_mode, value=val,
-                command=self._toggle_custom_out,
-                font=("Helvetica", 9),
-                bg=C["surface"], fg=C["text"],
-                selectcolor=C["input_bg"],
-                activebackground=C["surface"],
-                relief=tk.FLAT
-            ).pack(side=tk.LEFT, padx=(0, 14))
-
-        self.custom_out_entry = tk.Entry(
-            out_frame,
-            font=("Helvetica", 9),
-            bg=C["input_bg"], fg=C["sub"],
-            insertbackground=C["primary"],
-            relief=tk.FLAT, bd=1,
-            state=tk.DISABLED
+        # 出力先
+        self.out_zone = DropZone(
+            main, "出力先フォルダ",
+            "ドラッグ&ドロップ、またはクリックして選択",
+            select_mode="folder", allow_multiple=False
         )
-        self.custom_out_entry.pack(fill=tk.X, padx=14, pady=(6, 4))
-        self.custom_out_entry.insert(0, "出力先フォルダのパスを入力、またはペースト...")
+        self.out_zone.pack(fill=tk.X, **pad)
+        self.out_zone.on_change = self._update_count
 
-        tk.Button(out_frame, text="フォルダ選択",
-                  command=self._pick_custom_out,
-                  font=("Helvetica", 9),
-                  bg=C["accent"], fg=C["text"],
-                  activebackground=C["primary"], activeforeground="white",
-                  relief=tk.FLAT, bd=0, padx=10, pady=3, cursor="hand2",
-                  state=tk.DISABLED
-                  ).pack(anchor="w", padx=14, pady=(0, 12))
-        self._custom_btn = out_frame.winfo_children()[-1]
-
-        # ── ファイル件数プレビュー ──
+        # ファイル件数
         self.count_lbl = tk.Label(
             main, text="",
             font=("Helvetica", 9),
@@ -1044,75 +1007,69 @@ class PdfFrame(tk.Frame):
 
         section_divider(main)
 
-        # ── 実行 / キャンセル ──
+        # ボタン行
         btn_row = tk.Frame(main, bg=C["bg"])
         btn_row.pack(pady=(0, 10))
 
-        self.run_btn = tk.Button(
-            btn_row, text="▶  PDF変換を開始",
-            command=self._run,
+        self.run_btn = tk.Frame(btn_row, bg=C["accent"], cursor="arrow")
+        self._run_lbl = tk.Label(self.run_btn,
+            text="▶  PDF変換を開始",
             font=("Helvetica", 14, "bold"),
-            bg=C["accent"], fg="#AACFEE",
-            activebackground=C["primary"], activeforeground="white",
-            relief=tk.FLAT, bd=0, padx=30, pady=12,
-            cursor="arrow", state=tk.DISABLED
-        )
+            bg=C["accent"], fg="#AACFEE", padx=30, pady=12)
+        self._run_lbl.pack()
+        def _run_enter(e):
+            if self._run_enabled:
+                self.run_btn.configure(bg=C["primary"]); self._run_lbl.configure(bg=C["primary"])
+        def _run_leave(e):
+            if not self._run_enabled:
+                self.run_btn.configure(bg=C["accent"]); self._run_lbl.configure(bg=C["accent"])
+        def _run_click(e):
+            if self._run_enabled: self._run()
+        for _w in (self.run_btn, self._run_lbl):
+            _w.bind("<Enter>", _run_enter); _w.bind("<Leave>", _run_leave); _w.bind("<Button-1>", _run_click)
         self.run_btn.pack(side=tk.LEFT, padx=(0, 12))
 
-        self.cancel_btn = tk.Button(
-            btn_row, text="■ 中断",
-            command=self._cancel,
+        self.cancel_btn = tk.Frame(btn_row, bg="#3A1010", cursor="arrow")
+        self._cancel_lbl = tk.Label(self.cancel_btn, text="■ 中断",
             font=("Helvetica", 11),
-            bg="#3A1010", fg=C["err"],
-            activebackground=C["err"], activeforeground="white",
-            relief=tk.FLAT, bd=0, padx=16, pady=12,
-            cursor="arrow", state=tk.DISABLED
-        )
+            bg="#3A1010", fg=C["err"], padx=16, pady=12)
+        self._cancel_lbl.pack()
+        def _can_enter(e):
+            if self._cancel_enabled:
+                self.cancel_btn.configure(bg=C["err"]); self._cancel_lbl.configure(bg=C["err"], fg="white")
+        def _can_leave(e):
+            if self._cancel_enabled:
+                self.cancel_btn.configure(bg="#3A1010"); self._cancel_lbl.configure(bg="#3A1010", fg=C["err"])
+        def _can_click(e):
+            if self._cancel_enabled: self._cancel()
+        for _w in (self.cancel_btn, self._cancel_lbl):
+            _w.bind("<Enter>", _can_enter); _w.bind("<Leave>", _can_leave); _w.bind("<Button-1>", _can_click)
         self.cancel_btn.pack(side=tk.LEFT)
 
-        # ── ログ ──
         self.log_txt = make_log_widget(main)
         log_write(self.log_txt, "フォルダをドロップして変換を開始してください", "info")
-
-        # ── LibreOffice 確認メッセージ ──
-        lo = _get_libreoffice_path()
-        lo_exists = os.path.exists(lo.strip('"')) if lo != "soffice" else True
-        if not lo_exists:
-            log_write(self.log_txt,
-                      "⚠️  LibreOffice が見つかりません。インストールしてください。",
-                      "warning")
-
-    def _toggle_custom_out(self):
-        mode = self.out_mode.get()
-        state = tk.NORMAL if mode == "custom" else tk.DISABLED
-        self.custom_out_entry.configure(state=state)
-        self._custom_btn.configure(state=state)
-
-    def _pick_custom_out(self):
-        p = filedialog.askdirectory(title="出力先フォルダを選択")
-        if p:
-            self.custom_out_entry.configure(state=tk.NORMAL)
-            self.custom_out_entry.delete(0, tk.END)
-            self.custom_out_entry.insert(0, p)
 
     def _update_count(self):
         paths = self.src_zone.selected_paths
         if not paths:
             self.count_lbl.configure(text="")
-            self.run_btn.configure(state=tk.DISABLED, bg=C["accent"],
-                                   fg="#AACFEE", cursor="arrow")
+            self._run_enabled = False
+            self.run_btn.configure(bg=C["accent"], cursor="arrow")
+            self._run_lbl.configure(bg=C["accent"], fg="#AACFEE")
             return
-        files = scan_pdf_targets(paths)
+        file_pairs = scan_pdf_targets(paths)
         self.count_lbl.configure(
-            text=f"対象ファイル: {len(files)} 件",
-            fg=C["info"] if files else C["warn"]
+            text=f"対象ファイル: {len(file_pairs)} 件",
+            fg=C["info"] if file_pairs else C["warn"]
         )
-        if files:
-            self.run_btn.configure(state=tk.NORMAL, bg=C["primary"],
-                                   fg="white", cursor="hand2")
+        if file_pairs:
+            self._run_enabled = True
+            self.run_btn.configure(bg=C["primary"], cursor="hand2")
+            self._run_lbl.configure(bg=C["primary"], fg="#FFFFFF")
         else:
-            self.run_btn.configure(state=tk.DISABLED, bg=C["accent"],
-                                   fg="#AACFEE", cursor="arrow")
+            self._run_enabled = False
+            self.run_btn.configure(bg=C["accent"], cursor="arrow")
+            self._run_lbl.configure(bg=C["accent"], fg="#AACFEE")
 
     def _log(self, msg, tag=""):
         self.after(0, lambda m=msg, t=tag: log_write(self.log_txt, m, t))
@@ -1123,9 +1080,12 @@ class PdfFrame(tk.Frame):
 
     def _run(self):
         self._cancel_flag.clear()
-        self.run_btn.configure(state=tk.DISABLED,
-                               text="⏳  変換中...", bg=C["accent"], fg=C["warn"])
-        self.cancel_btn.configure(state=tk.NORMAL, cursor="hand2")
+        self._run_enabled = False
+        self.run_btn.configure(bg=C["accent"], cursor="arrow")
+        self._run_lbl.configure(bg=C["accent"], fg=C["warn"], text="⏳  変換中...")
+        self._cancel_enabled = True
+        self.cancel_btn.configure(bg="#3A1010", cursor="hand2")
+        self._cancel_lbl.configure(bg="#3A1010", fg=C["err"])
         self.log_txt.configure(state=tk.NORMAL)
         self.log_txt.delete("1.0", tk.END)
         self.log_txt.configure(state=tk.DISABLED)
@@ -1134,22 +1094,27 @@ class PdfFrame(tk.Frame):
     def _worker(self):
         try:
             src_paths = self.src_zone.selected_paths
-            files = scan_pdf_targets(src_paths)
-            total = len(files)
+            file_pairs = scan_pdf_targets(src_paths)
+            total = len(file_pairs)
             self._log(f"対象ファイル {total} 件を変換します...", "info")
 
+            out_paths = self.out_zone.selected_paths
+            base_out = Path(out_paths[0]) if out_paths else None
+
             success, fail = 0, 0
-            for i, f in enumerate(files, 1):
+            for i, (f, root) in enumerate(file_pairs, 1):
                 if self._cancel_flag.is_set():
                     self._log(f"中断しました（{i-1}/{total} 件処理済）", "warning")
                     break
 
                 self._log(f"[{i}/{total}] {f.name}")
 
-                # 出力先を決定
-                if self.out_mode.get() == "custom":
-                    raw_out = self.custom_out_entry.get().strip()
-                    out_dir = Path(raw_out) if raw_out and raw_out != "出力先フォルダのパスを入力、またはペースト..." else f.parent
+                if base_out:
+                    try:
+                        rel = f.parent.relative_to(root)
+                        out_dir = base_out / root.name / rel
+                    except ValueError:
+                        out_dir = base_out / root.name
                 else:
                     out_dir = f.parent
 
@@ -1173,8 +1138,10 @@ class PdfFrame(tk.Frame):
             self.after(0, self._reset_btns)
 
     def _reset_btns(self):
-        self.cancel_btn.configure(state=tk.DISABLED, cursor="arrow")
-        self.run_btn.configure(text="▶  PDF変換を開始")
+        self._cancel_enabled = False
+        self.cancel_btn.configure(bg="#3A1010", cursor="arrow")
+        self._cancel_lbl.configure(bg="#3A1010", fg=C["err"])
+        self._run_lbl.configure(text="▶  PDF変換を開始")
         self._update_count()
 
 

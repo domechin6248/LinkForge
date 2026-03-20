@@ -1,12 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# ════════════════════════════════════════
+#  楽々JC v2.0.0  ─  Mac ビルド用 spec
+#  実行: pyinstaller 楽々JC.spec
+# ════════════════════════════════════════
 
 a = Analysis(
-    ['rakuraku_jc.py'],
+    ['linkforge.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'docx',
+        'docx.oxml',
+        'docx.oxml.ns',
+        'lxml',
+        'lxml._elementpath',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -32,6 +41,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='icon.icns',
 )
 coll = COLLECT(
     exe,
@@ -45,6 +55,15 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='楽々JC.app',
-    icon=None,
-    bundle_identifier=None,
+    icon='icon.icns',
+    bundle_identifier='com.rakuraku.jc',
+    info_plist={
+        'CFBundleName':             '楽々JC',
+        'CFBundleDisplayName':      '楽々JC',
+        'CFBundleVersion':          '2.0.0',
+        'CFBundleShortVersionString': '2.0.0',
+        'NSHighResolutionCapable':  True,
+        'LSMinimumSystemVersion':   '10.13.0',
+        'NSHumanReadableCopyright': '© 2025 楽々JC',
+    },
 )
