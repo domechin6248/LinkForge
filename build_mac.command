@@ -64,6 +64,9 @@ DESKTOP="$HOME/Desktop"
 if [ -d "$DESKTOP" ]; then
     rm -rf "$DESKTOP/楽々JC.app" 2>/dev/null || true
     cp -r "dist/楽々JC.app" "$DESKTOP/"
+    # アイコンキャッシュをリフレッシュ（真っ白アイコン対策）
+    touch "$DESKTOP/楽々JC.app"
+    killall Dock 2>/dev/null || true
     echo "  ✓ デスクトップ: ~/Desktop/楽々JC.app"
 else
     echo "  ⚠️  デスクトップが見つかりません。dist/楽々JC.app を使用してください。"
