@@ -18,6 +18,7 @@ import platform
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from copy import deepcopy
 import tkinter as tk
@@ -88,6 +89,12 @@ PDF_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp",
     ".txt",
 }
+
+# 変換エンジン振り分け用
+_WORD_EXTS  = {".doc", ".docx", ".odt", ".rtf", ".txt"}
+_EXCEL_EXTS = {".xls", ".xlsx", ".ods", ".csv"}
+_PPT_EXTS   = {".ppt", ".pptx", ".odp"}
+_IMG_EXTS   = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -160,7 +167,6 @@ class FlatButton(tk.Frame):
     """tk.Frame + tk.Label の組み合わせで macOS ネイティブテーマを回避。
     tk.Button と同じ引数でほぼ互換の configure/config を持つ。"""
 
-    # tk.Button 専用で FlatButton には不要なキーを無視
     _IGNORE = frozenset({
         "activebackground", "activeforeground",
         "highlightbackground", "highlightthickness",
@@ -173,19 +179,16 @@ class FlatButton(tk.Frame):
         for k in list(kw):
             if k in self._IGNORE:
                 del kw[k]
-
         self._cmd    = command
         self._state  = state
         self._bg     = bg or C["accent"]
         self._fg     = fg
         self._cursor = cursor
-
         if bold:
             if isinstance(font, tuple) and len(font) >= 2:
                 font = (font[0], font[1], "bold")
             else:
                 font = ("Helvetica", 9, "bold")
-
         _cur = cursor if state == tk.NORMAL else "arrow"
         super().__init__(parent, bg=self._bg, cursor=_cur, **kw)
         self._lbl = tk.Label(
@@ -193,13 +196,11 @@ class FlatButton(tk.Frame):
             font=font, padx=padx, pady=pady, cursor=_cur
         )
         self._lbl.pack(fill=tk.BOTH, expand=True)
-
         for w in (self, self._lbl):
             w.bind("<Button-1>", self._on_click)
             w.bind("<Enter>",    self._on_enter)
             w.bind("<Leave>",    self._on_leave)
 
-    # ── イベント ────────────────────────────────────────────────
     def _on_click(self, e=None):
         if self._state == tk.NORMAL and self._cmd:
             self._cmd()
@@ -214,12 +215,10 @@ class FlatButton(tk.Frame):
             super().configure(bg=self._bg)
             self._lbl.configure(bg=self._bg)
 
-    # ── configure / config ──────────────────────────────────────
     def configure(self, **kw):
         for k in list(kw):
             if k in self._IGNORE:
                 del kw[k]
-
         text    = kw.pop("text",    None)
         state   = kw.pop("state",   None)
         bg      = kw.pop("bg",      None)
@@ -228,7 +227,6 @@ class FlatButton(tk.Frame):
         command = kw.pop("command", None)
         if kw:
             super().configure(**kw)
-
         if command is not None:
             self._cmd = command
         if text is not None:
@@ -239,12 +237,8 @@ class FlatButton(tk.Frame):
             self._fg = fg
         if cursor is not None:
             self._cursor = cursor
-
-        # Apply state LAST so bg/fg are already stored
         if state is not None:
             self._state = state
-
-        # Sync visuals
         if self._state == tk.NORMAL:
             super().configure(bg=self._bg, cursor=self._cursor)
             self._lbl.configure(bg=self._bg, fg=self._fg, cursor=self._cursor)
@@ -260,7 +254,6 @@ class FlatButton(tk.Frame):
 # ════════════════════════════════════════════════════════════════
 
 def nav_button(parent, text, command):
-    """画面間移動用の小さなボタン"""
     return FlatButton(
         parent, text=text, command=command,
         font=("Helvetica", 9), bold=True,
@@ -271,7 +264,6 @@ def nav_button(parent, text, command):
 
 def make_btn(parent, text, command, font_size=9, bold=False,
              bg=None, fg="#FFFFFF", padx=12, pady=4, cursor="hand2", **kw):
-    """共通ボタン生成ヘルパー（スタイル統一用）"""
     return FlatButton(
         parent, text=text, command=command,
         font=("Helvetica", font_size), bold=bold,
@@ -281,8 +273,7 @@ def make_btn(parent, text, command, font_size=9, bold=False,
 
 
 class LoggedFrame(tk.Frame):
-    """ログウィジェット付き Frame の基底クラス。
-    サブクラスは self.log_txt を _build() 内で設定すること。"""
+    """ログウィジェット付き Frame の基底クラス。"""
     def _log(self, msg, tag=""):
         self.after(0, lambda m=msg, t=tag: log_write(self.log_txt, m, t))
 
@@ -504,7 +495,7 @@ class DropZone(tk.Frame):
 
 
 # ════════════════════════════════════════════════════════════════
-#  リンク処理コア（既存ロジックをそのまま移植）
+#  リンク処理コア
 # ════════════════════════════════════════════════════════════════
 
 import re as _re
@@ -519,6 +510,7 @@ def _strip_number(name):
     return name.strip()
 
 def get_file_map(link_dirs):
+    """リンク資料フォルダを走査してキー→相対パスのマップを返す"""
     fm = {}
     for link_dir in link_dirs:
         base = Path(link_dir)
@@ -534,6 +526,18 @@ def get_file_map(link_dirs):
                     fm[stripped] = rel_str
                     fm[stripped + f.suffix] = rel_str
     return fm
+
+def _to_file_uri(path: Path) -> str:
+    """絶対パスを file:// URI に変換。スペース・日本語等をURLエンコード。
+    これにより Word のハイパーリンクをクリック一発で開けるようにする。"""
+    abs_str = str(path.resolve())
+    if platform.system() == "Windows":
+        abs_str = abs_str.replace("\\", "/")
+        encoded = urllib.parse.quote(abs_str, safe="/:")
+        return "file:///" + encoded.lstrip("/")
+    else:
+        encoded = urllib.parse.quote(abs_str, safe="/:")
+        return "file://" + encoded
 
 def copy_link_trees(link_dirs, dst_parent):
     for link_dir in link_dirs:
@@ -626,16 +630,22 @@ def process_paragraph(para, fm, part):
 
 
 # ════════════════════════════════════════════════════════════════
-#  PDF変換コア
+#  PDF変換コア ─ ネイティブ Office 優先 / LibreOffice フォールバック
+# ════════════════════════════════════════════════════════════════
+#
+#  優先順位:
+#    Windows → Word/Excel/PowerPoint COM オートメーション（pywin32）
+#    Mac     → AppleScript 経由でネイティブ Office
+#    共通    → LibreOffice（未インストール時・非対応形式）
+#    画像    → Pillow → LibreOffice の順でフォールバック
 # ════════════════════════════════════════════════════════════════
 
-# Issue 5: フォーマット別 LibreOffice エクスポートフィルタ
+# LibreOffice フォールバック用フィルタマップ
 _LO_FILTER_MAP = {
-    **{e: "writer_pdf_Export"  for e in {".doc",".docx",".odt",".rtf",".txt"}},
-    **{e: "calc_pdf_Export"    for e in {".xls",".xlsx",".ods",".csv"}},
-    **{e: "impress_pdf_Export" for e in {".ppt",".pptx",".odp"}},
-    **{e: "draw_pdf_Export"    for e in {".jpg",".jpeg",".png",".bmp",
-                                          ".tiff",".tif",".gif",".webp"}},
+    **{e: "writer_pdf_Export"  for e in _WORD_EXTS},
+    **{e: "calc_pdf_Export"    for e in _EXCEL_EXTS},
+    **{e: "impress_pdf_Export" for e in _PPT_EXTS},
+    **{e: "draw_pdf_Export"    for e in _IMG_EXTS},
 }
 
 
@@ -653,8 +663,322 @@ def _get_libreoffice_path():
     return "soffice"
 
 
+def _convert_libreoffice(input_path: Path, output_dir: Path, ext: str):
+    """LibreOffice によるフォールバック変換"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lo = _get_libreoffice_path()
+    lo_filter = _LO_FILTER_MAP.get(ext, "writer_pdf_Export")
+    cmd = (
+        f'{lo} --headless --norestore --nofirststartwizard '
+        f'--convert-to "pdf:{lo_filter}" '
+        f'"{input_path}" --outdir "{output_dir}"'
+    )
+    try:
+        result = subprocess.run(cmd, shell=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=120)
+        out_pdf = output_dir / (input_path.stem + ".pdf")
+        if out_pdf.exists():
+            return True, str(out_pdf)
+        err = result.stderr.decode(errors="ignore")
+        return False, err or "出力ファイルが生成されませんでした"
+    except subprocess.TimeoutExpired:
+        return False, "タイムアウト（120秒）"
+    except Exception as e:
+        return False, str(e)
+
+
+def _convert_image(input_path: Path, output_dir: Path):
+    """画像 → PDF。Pillow があれば使用、なければ LibreOffice へ"""
+    try:
+        from PIL import Image
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_pdf = output_dir / (input_path.stem + ".pdf")
+        with Image.open(input_path) as img:
+            img.convert("RGB").save(str(out_pdf), "PDF", resolution=150)
+        if out_pdf.exists():
+            return True, str(out_pdf)
+        return False, "画像PDF変換失敗"
+    except ImportError:
+        return _convert_libreoffice(input_path, output_dir, input_path.suffix.lower())
+    except Exception as e:
+        return False, str(e)
+
+
+# ── Windows COM オートメーション ──────────────────────────────
+
+def _win_word(abs_in: str, abs_out: str):
+    """Word COM: .doc/.docx/.odt/.rtf/.txt → PDF"""
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return None, "pywin32 未インストール"
+    pythoncom.CoInitialize()
+    word = None; doc = None
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0          # wdAlertsNone
+        doc = word.Documents.Open(
+            abs_in,
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            NoEncodingDialog=True,
+        )
+        doc.ExportAsFixedFormat(
+            OutputFileName=abs_out,
+            ExportFormat=17,            # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,              # wdExportOptimizeForPrint
+            Range=0,                    # wdExportAllDocument
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+        out = Path(abs_out)
+        return (True, str(out)) if out.exists() else (False, "PDF未生成")
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if doc:
+            try: doc.Close(False)
+            except: pass
+        if word:
+            try: word.Quit()
+            except: pass
+        pythoncom.CoUninitialize()
+
+
+def _win_excel(abs_in: str, abs_out: str):
+    """Excel COM: .xls/.xlsx/.ods/.csv → PDF"""
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return None, "pywin32 未インストール"
+    pythoncom.CoInitialize()
+    excel = None; wb = None
+    try:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.AskToUpdateLinks = False
+        wb = excel.Workbooks.Open(
+            abs_in, UpdateLinks=0, ReadOnly=True, AddToMru=False,
+        )
+        wb.ExportAsFixedFormat(
+            Type=0,                     # xlTypePDF
+            Filename=abs_out,
+            Quality=0,                  # xlQualityStandard
+            IncludeDocProperties=True,
+            IgnorePrintAreas=False,
+            OpenAfterPublish=False,
+        )
+        out = Path(abs_out)
+        return (True, str(out)) if out.exists() else (False, "PDF未生成")
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if wb:
+            try: wb.Close(False)
+            except: pass
+        if excel:
+            try: excel.Quit()
+            except: pass
+        pythoncom.CoUninitialize()
+
+
+def _win_ppt(abs_in: str, abs_out: str):
+    """PowerPoint COM: .ppt/.pptx/.odp → PDF"""
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return None, "pywin32 未インストール"
+    pythoncom.CoInitialize()
+    ppt = None; prs = None
+    try:
+        ppt = win32com.client.DispatchEx("PowerPoint.Application")
+        prs = ppt.Presentations.Open(
+            abs_in, ReadOnly=True, Untitled=True, WithWindow=False,
+        )
+        prs.ExportAsFixedFormat(
+            Path=abs_out,
+            FixedFormatType=2,          # ppFixedFormatTypePDF
+            Intent=1,                   # ppFixedFormatIntentPrint
+            HandoutOrder=1,
+            OutputType=1,               # ppPrintOutputSlides
+            PrintHiddenSlides=False,
+            PrintRange=None,
+            RangeType=1,                # ppPrintAll
+            SlideShowName="",
+            IncludeDocProperties=True,
+            KeepIRM=True,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+        out = Path(abs_out)
+        return (True, str(out)) if out.exists() else (False, "PDF未生成")
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if prs:
+            try: prs.Close()
+            except: pass
+        if ppt:
+            try: ppt.Quit()
+            except: pass
+        pythoncom.CoUninitialize()
+
+
+def _convert_windows(input_path: Path, output_dir: Path, ext: str):
+    """Windows: COM オートメーションでネイティブ変換、失敗時は LibreOffice"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    abs_in  = str(input_path.resolve())
+    abs_out = str((output_dir / (input_path.stem + ".pdf")).resolve())
+
+    if ext in _WORD_EXTS:
+        result = _win_word(abs_in, abs_out)
+    elif ext in _EXCEL_EXTS:
+        result = _win_excel(abs_in, abs_out)
+    elif ext in _PPT_EXTS:
+        result = _win_ppt(abs_in, abs_out)
+    elif ext in _IMG_EXTS:
+        return _convert_image(input_path, output_dir)
+    else:
+        return _convert_libreoffice(input_path, output_dir, ext)
+
+    # result[0] が None = pywin32 なし → LibreOffice にフォールバック
+    if result[0] is None:
+        return _convert_libreoffice(input_path, output_dir, ext)
+    return result
+
+
+# ── Mac AppleScript ───────────────────────────────────────────
+
+def _esc_as(s: str) -> str:
+    """AppleScript 文字列リテラル用エスケープ（" と \ を処理）"""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _run_applescript(script: str, timeout: int = 120):
+    """osascript でスクリプトを stdin から実行。(returncode, stderr) を返す"""
+    try:
+        result = subprocess.run(
+            ["osascript"],
+            input=script.encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return result.returncode, result.stderr.decode(errors="ignore")
+    except subprocess.TimeoutExpired:
+        return -1, "タイムアウト（120秒）"
+    except Exception as e:
+        return -1, str(e)
+
+
+def _mac_word(abs_in: str, abs_out: str):
+    """Mac: AppleScript で Word → PDF"""
+    if not Path("/Applications/Microsoft Word.app").exists():
+        return None, "Microsoft Word 未インストール"
+    script = f'''
+tell application "Microsoft Word"
+    set theDoc to open POSIX file "{_esc_as(abs_in)}"
+    save as theDoc file name "{_esc_as(abs_out)}" file format format PDF
+    close theDoc saving no
+end tell
+'''
+    rc, err = _run_applescript(script)
+    out = Path(abs_out)
+    if out.exists():
+        return True, str(out)
+    return False, err or "PDF未生成（Word AppleScript）"
+
+
+def _mac_excel(abs_in: str, abs_out: str):
+    """Mac: AppleScript で Excel → PDF"""
+    if not Path("/Applications/Microsoft Excel.app").exists():
+        return None, "Microsoft Excel 未インストール"
+    script = f'''
+tell application "Microsoft Excel"
+    open POSIX file "{_esc_as(abs_in)}"
+    set theWb to active workbook
+    save workbook as theWb filename "{_esc_as(abs_out)}" file format PDF file format
+    close theWb saving no
+end tell
+'''
+    rc, err = _run_applescript(script)
+    out = Path(abs_out)
+    if out.exists():
+        return True, str(out)
+    return False, err or "PDF未生成（Excel AppleScript）"
+
+
+def _mac_ppt(abs_in: str, abs_out: str):
+    """Mac: AppleScript で PowerPoint → PDF"""
+    if not Path("/Applications/Microsoft PowerPoint.app").exists():
+        return None, "Microsoft PowerPoint 未インストール"
+    script = f'''
+tell application "Microsoft PowerPoint"
+    open POSIX file "{_esc_as(abs_in)}"
+    set thePrs to active presentation
+    save thePrs in "{_esc_as(abs_out)}" as save as PDF
+    close thePrs
+end tell
+'''
+    rc, err = _run_applescript(script)
+    out = Path(abs_out)
+    if out.exists():
+        return True, str(out)
+    return False, err or "PDF未生成（PowerPoint AppleScript）"
+
+
+def _convert_mac(input_path: Path, output_dir: Path, ext: str):
+    """Mac: ネイティブ Office AppleScript、失敗時は LibreOffice"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    abs_in  = str(input_path.resolve())
+    abs_out = str((output_dir / (input_path.stem + ".pdf")).resolve())
+
+    if ext in _WORD_EXTS:
+        result = _mac_word(abs_in, abs_out)
+    elif ext in _EXCEL_EXTS:
+        result = _mac_excel(abs_in, abs_out)
+    elif ext in _PPT_EXTS:
+        result = _mac_ppt(abs_in, abs_out)
+    elif ext in _IMG_EXTS:
+        return _convert_image(input_path, output_dir)
+    else:
+        return _convert_libreoffice(input_path, output_dir, ext)
+
+    # result[0] が None = Office 未インストール → LibreOffice にフォールバック
+    if result[0] is None:
+        return _convert_libreoffice(input_path, output_dir, ext)
+    return result
+
+
+def convert_to_pdf(input_path: Path, output_dir: Path, log_cb=None):
+    """メイン変換エントリ。OS に応じてネイティブ Office を優先し、
+    未インストール・失敗時は LibreOffice へ自動フォールバック。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ext = input_path.suffix.lower()
+    os_name = platform.system()
+
+    if os_name == "Windows":
+        return _convert_windows(input_path, output_dir, ext)
+    elif os_name == "Darwin":
+        return _convert_mac(input_path, output_dir, ext)
+    else:
+        return _convert_libreoffice(input_path, output_dir, ext)
+
+
 def scan_all_pdf_targets(paths):
-    """フォルダ / ファイルのリストから変換・コピー対象を再帰収集。
+    """PDF変換・コピー対象を再帰収集。
     PDF_EXTENSIONS → 変換対象、.pdf → コピー対象として収集する。"""
     result = []
     for p in paths:
@@ -668,36 +992,6 @@ def scan_all_pdf_targets(paths):
             if p.suffix.lower() in PDF_EXTENSIONS or p.suffix.lower() == ".pdf":
                 result.append(p)
     return result
-
-
-def convert_to_pdf(input_path: Path, output_dir: Path, log_cb=None):
-    """1ファイルをPDFに変換。成功したらTrue。
-    Issue 5: --norestore / --nofirststartwizard と形式別フィルタを使用。"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lo = _get_libreoffice_path()
-    ext = input_path.suffix.lower()
-    lo_filter = _LO_FILTER_MAP.get(ext, "writer_pdf_Export")
-    cmd = (
-        f'{lo} --headless --norestore --nofirststartwizard '
-        f'--convert-to "pdf:{lo_filter}" '
-        f'"{input_path}" --outdir "{output_dir}"'
-    )
-    try:
-        result = subprocess.run(
-            cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=120
-        )
-        out_pdf = output_dir / (input_path.stem + ".pdf")
-        if out_pdf.exists():
-            return True, str(out_pdf)
-        else:
-            err = result.stderr.decode(errors="ignore")
-            return False, err or "出力ファイルが生成されませんでした"
-    except subprocess.TimeoutExpired:
-        return False, "タイムアウト（120秒）"
-    except Exception as e:
-        return False, str(e)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -744,103 +1038,58 @@ class LauncherFrame(tk.Frame):
 
     def _build(self):
         build_header(self, "⛓  楽々JC", "自動処理ツール集")
-
-        # ── 中央コンテンツ ──
         center = tk.Frame(self, bg=C["bg"])
         center.pack(expand=True)
-
         tk.Label(center, text="使用する機能を選んでください",
                  font=("Helvetica", 13),
                  bg=C["bg"], fg=C["text"]
                  ).pack(pady=(40, 32))
-
-        # ── ボタンエリア ──
         btn_area = tk.Frame(center, bg=C["bg"])
         btn_area.pack()
-
-        self._feature_btn(
-            btn_area,
-            icon="⛓",
-            title="リンク一括設定",
-            desc="Wordファイルへ\nハイパーリンクを自動挿入",
-            command=self.on_link,
-            col=0
-        )
-
-        self._feature_btn(
-            btn_area,
-            icon="📄",
-            title="PDF一括変換",
-            desc="Word / Excel / PowerPoint等を\nPDFに一括変換",
-            command=self.on_pdf,
-            col=1
-        )
-
-        # ── 将来拡張用プレースホルダー ──
+        self._feature_btn(btn_area, "⛓", "リンク一括設定",
+                          "Wordファイルへ\nハイパーリンクを自動挿入",
+                          self.on_link, col=0)
+        self._feature_btn(btn_area, "📄", "PDF一括変換",
+                          "Word / Excel / PowerPoint等を\nPDFに一括変換",
+                          self.on_pdf, col=1)
         self._placeholder_btn(btn_area, col=2)
-
         tk.Label(center, text=f"楽々JC  v{APP_VERSION}",
                  font=("Helvetica", 8),
                  bg=C["bg"], fg="#5A7AAA"
                  ).pack(pady=(40, 0))
 
     def _feature_btn(self, parent, icon, title, desc, command, col):
-        frame = tk.Frame(
-            parent, bg=C["surface"],
-            highlightbackground=C["border"],
-            highlightthickness=2,
-            cursor="hand2"
-        )
+        frame = tk.Frame(parent, bg=C["surface"],
+                         highlightbackground=C["border"],
+                         highlightthickness=2, cursor="hand2")
         frame.grid(row=0, column=col, padx=14, pady=4, ipadx=6, ipady=6)
-
-        tk.Label(frame, text=icon,
-                 font=("Helvetica", 36),
-                 bg=C["surface"], fg=C["primary"]
-                 ).pack(pady=(24, 6), padx=36)
-
-        tk.Label(frame, text=title,
-                 font=("Helvetica", 14, "bold"),
-                 bg=C["surface"], fg=C["text"]
-                 ).pack()
-
-        tk.Label(frame, text=desc,
-                 font=("Helvetica", 9),
+        tk.Label(frame, text=icon, font=("Helvetica", 36),
+                 bg=C["surface"], fg=C["primary"]).pack(pady=(24, 6), padx=36)
+        tk.Label(frame, text=title, font=("Helvetica", 14, "bold"),
+                 bg=C["surface"], fg=C["text"]).pack()
+        tk.Label(frame, text=desc, font=("Helvetica", 9),
                  bg=C["surface"], fg=C["sub"],
-                 justify=tk.CENTER
-                 ).pack(pady=(4, 20), padx=20)
-
-        # ホバー効果
+                 justify=tk.CENTER).pack(pady=(4, 20), padx=20)
         def on_enter(e, f=frame):
-            f.configure(highlightbackground=C["primary"], highlightthickness=2)
+            f.configure(highlightbackground=C["primary"])
         def on_leave(e, f=frame):
-            f.configure(highlightbackground=C["border"], highlightthickness=2)
-        def on_click(e):
-            command()
-
+            f.configure(highlightbackground=C["border"])
+        def on_click(e): command()
         for w in frame.winfo_children() + [frame]:
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
             w.bind("<Button-1>", on_click)
 
     def _placeholder_btn(self, parent, col):
-        frame = tk.Frame(
-            parent, bg=C["surface"],
-            highlightbackground=C["border"],
-            highlightthickness=1,
-        )
+        frame = tk.Frame(parent, bg=C["surface"],
+                         highlightbackground=C["border"], highlightthickness=1)
         frame.grid(row=0, column=col, padx=14, pady=4, ipadx=6, ipady=6)
-        tk.Label(frame, text="＋",
-                 font=("Helvetica", 36),
-                 bg=C["surface"], fg=C["border"]
-                 ).pack(pady=(24, 6), padx=36)
-        tk.Label(frame, text="機能追加予定",
-                 font=("Helvetica", 12),
-                 bg=C["surface"], fg=C["border"]
-                 ).pack()
-        tk.Label(frame, text="近日公開",
-                 font=("Helvetica", 9),
-                 bg=C["surface"], fg=C["border"]
-                 ).pack(pady=(4, 20), padx=20)
+        tk.Label(frame, text="＋", font=("Helvetica", 36),
+                 bg=C["surface"], fg=C["border"]).pack(pady=(24, 6), padx=36)
+        tk.Label(frame, text="機能追加予定", font=("Helvetica", 12),
+                 bg=C["surface"], fg=C["border"]).pack()
+        tk.Label(frame, text="近日公開", font=("Helvetica", 9),
+                 bg=C["surface"], fg=C["border"]).pack(pady=(4, 20), padx=20)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -851,31 +1100,26 @@ class LinkFrame(LoggedFrame):
 
     def __init__(self, parent, on_back, on_go_pdf, dnd_ok, on_check_update=None):
         super().__init__(parent, bg=C["bg"])
-        self.on_back          = on_back
-        self.on_go_pdf        = on_go_pdf
-        self.dnd_ok           = dnd_ok
-        self.on_check_update  = on_check_update
+        self.on_back         = on_back
+        self.on_go_pdf       = on_go_pdf
+        self.dnd_ok          = dnd_ok
+        self.on_check_update = on_check_update
         self.folder_name_entries = []
         self._build()
 
     def _build(self):
         build_header(self, "⛓  リンク一括設定", "Word ハイパーリンク自動挿入",
                      on_update=self.on_check_update)
-
-        # ── ナビ行 ──
         nav = tk.Frame(self, bg=C["bg"])
         nav.pack(fill=tk.X, padx=16, pady=(8, 0))
         nav_button(nav, "← ホームへ戻る", self.on_back).pack(side=tk.LEFT)
         nav_button(nav, "PDF一括変換へ →", self.on_go_pdf).pack(side=tk.RIGHT)
-
-        # ── D&D状態 ──
-        self.dnd_lbl = tk.Label(nav, text="D&D ✓" if self.dnd_ok else "---",
-                                 font=("Helvetica", 9),
-                                 bg=C["bg"],
-                                 fg=C["ok"] if self.dnd_ok else "#AACFEE")
+        self.dnd_lbl = tk.Label(nav,
+                                text="D&D ✓" if self.dnd_ok else "---",
+                                font=("Helvetica", 9), bg=C["bg"],
+                                fg=C["ok"] if self.dnd_ok else "#AACFEE")
         self.dnd_lbl.pack(side=tk.RIGHT, padx=10)
 
-        # ── スクロールエリア ──
         _, main = make_scrollable_frame(self)
         pad = dict(padx=16, pady=(0, 10))
 
@@ -906,26 +1150,19 @@ class LinkFrame(LoggedFrame):
         self.output_zone.on_change = self._check_ready
 
         self.fname_outer = tk.Frame(main, bg=C["bg"])
-
         self.structure_lbl = tk.Label(
-            main, text="",
-            font=("Helvetica", 9),
-            bg=C["bg"], fg=C["sub"],
-            justify=tk.LEFT, anchor="w"
+            main, text="", font=("Helvetica", 9),
+            bg=C["bg"], fg=C["sub"], justify=tk.LEFT, anchor="w"
         )
         self.structure_lbl.pack(padx=16, anchor="w")
 
         section_divider(main)
 
-        # Issue 1: FlatButton で macOS カラーを確実に反映
         self.run_btn = FlatButton(
-            main,
-            text="▶  リンクを作成",
-            command=self._run,
+            main, text="▶  リンクを作成", command=self._run,
             font=("Helvetica", 14), bold=True,
             bg=C["accent"], fg="#AACFEE",
-            padx=30, pady=12,
-            cursor="arrow", state=tk.DISABLED
+            padx=30, pady=12, cursor="arrow", state=tk.DISABLED
         )
         self.run_btn.pack(pady=(0, 10))
 
@@ -933,8 +1170,6 @@ class LinkFrame(LoggedFrame):
         log_write(self.log_txt,
                   "D&D: 有効 ✓" if self.dnd_ok else "D&D: ダイアログ / パスペーストを利用",
                   "success" if self.dnd_ok else "info")
-
-    # ── リンク機能ロジック ──────────────────────────────────────
 
     def _on_word_changed(self):
         self._rebuild_folder_names()
@@ -947,23 +1182,19 @@ class LinkFrame(LoggedFrame):
         word_paths = self.word_zone.selected_paths
         if not word_paths:
             self.structure_lbl.configure(text=""); return
-
         tk.Label(self.fname_outer,
                  text="出力フォルダ名（変更可）",
                  font=("Helvetica", 10, "bold"),
                  bg=C["bg"], fg=C["sub"]
                  ).pack(anchor="w", padx=16, pady=(0, 4))
-
         for wp in word_paths:
             p = Path(wp)
             if p.name.startswith("~$"): continue
             row = tk.Frame(self.fname_outer, bg=C["bg"])
             row.pack(fill=tk.X, padx=16, pady=2)
             tk.Label(row, text=f"{p.name}  →",
-                     font=("Helvetica", 9),
-                     bg=C["bg"], fg=C["sub"],
-                     anchor="e", width=30
-                     ).pack(side=tk.LEFT, padx=(0, 6))
+                     font=("Helvetica", 9), bg=C["bg"], fg=C["sub"],
+                     anchor="e", width=30).pack(side=tk.LEFT, padx=(0, 6))
             var = tk.StringVar(value=p.stem)
             tk.Entry(row, textvariable=var,
                      font=("Helvetica", 10),
@@ -975,10 +1206,8 @@ class LinkFrame(LoggedFrame):
             FlatButton(row, text="戻す", command=_reset,
                        font=("Helvetica", 8),
                        bg=C["accent"], fg="#FFFFFF",
-                       padx=6, pady=2
-                       ).pack(side=tk.LEFT)
+                       padx=6, pady=2).pack(side=tk.LEFT)
             self.folder_name_entries.append((wp, var))
-
         self.fname_outer.pack(fill=tk.X, pady=(0, 4), before=self.structure_lbl)
         self._update_structure_label()
 
@@ -1019,6 +1248,7 @@ class LinkFrame(LoggedFrame):
             output_dir = Path(self.output_zone.selected_paths[0])
             fn_map     = {wp: var.get().strip() or Path(wp).stem
                           for wp, var in self.folder_name_entries}
+
             fm = get_file_map(link_dirs)
             if not fm:
                 self._log("[警告] リンク資料フォルダに対象ファイルがありません。", "warning")
@@ -1035,18 +1265,29 @@ class LinkFrame(LoggedFrame):
                        if not Path(wp).name.startswith("~$")]
             self._log(f"{len(entries)} 件の Word を処理...", "info")
             total = 0
+
             for wp, cname in entries:
                 wpath = Path(wp)
                 self._log(f"  {wpath.name}  →  {cname}/")
                 try:
-                    doc = Document(wpath)
                     out = output_dir / cname
                     out.mkdir(parents=True, exist_ok=True)
+
+                    # ① 先にリンクフォルダをコピー
                     copy_link_trees(link_dirs, out)
                     self._log(f"    資料フォルダ {len(link_dirs)} 個をコピー完了")
-                    cnt = sum(process_paragraph(p, fm, doc.part)
+
+                    # ② 絶対 file:// URI マップを構築（クリック即開き保証）
+                    #    fm の値は "FolderName/file.pdf" 形式 (out 直下からの相対)
+                    abs_fm = {key: _to_file_uri(out / rel)
+                              for key, rel in fm.items()}
+
+                    # ③ Wordを開いてリンク挿入 → 保存
+                    doc = Document(wpath)
+                    cnt = sum(process_paragraph(p, abs_fm, doc.part)
                               for p in iter_all_paragraphs(doc))
                     doc.save(out / wpath.name)
+
                     if cnt > 0:
                         self._log(f"    {cnt} 箇所リンク挿入", "success")
                     else:
@@ -1071,6 +1312,7 @@ class LinkFrame(LoggedFrame):
         self.run_btn.configure(text="▶  リンクを作成")
         self._check_ready()
 
+
 # ════════════════════════════════════════════════════════════════
 #  PDF一括変換 画面
 # ════════════════════════════════════════════════════════════════
@@ -1087,18 +1329,14 @@ class PdfFrame(LoggedFrame):
     def _build(self):
         build_header(self, "📄  PDF一括変換",
                      "Word / Excel / PowerPoint / 画像 → PDF")
-
-        # ── ナビ行 ──
         nav = tk.Frame(self, bg=C["bg"])
         nav.pack(fill=tk.X, padx=16, pady=(8, 0))
         nav_button(nav, "← ホームへ戻る", self.on_back).pack(side=tk.LEFT)
         nav_button(nav, "リンク一括設定へ →", self.on_go_link).pack(side=tk.RIGHT)
 
-        # ── スクロールエリア ──
         _, main = make_scrollable_frame(self)
         pad = dict(padx=16, pady=(0, 10))
 
-        # ── DropZone（フォルダ / ファイル複数対応）──
         self.src_zone = DropZone(
             main, "変換対象フォルダ / ファイル",
             "複数フォルダをドラッグ&ドロップ（サブフォルダも自動検索）",
@@ -1108,7 +1346,7 @@ class PdfFrame(LoggedFrame):
         self.src_zone.pack(fill=tk.X, **pad)
         self.src_zone.on_change = self._update_count
 
-        # ── 出力先（Issue 2: DropZone D&D 対応）──
+        # ── 出力先（DropZone D&D 対応）──
         out_frame = tk.Frame(main, bg=C["surface"],
                              highlightbackground=C["border"],
                              highlightthickness=2)
@@ -1136,65 +1374,61 @@ class PdfFrame(LoggedFrame):
                 relief=tk.FLAT
             ).pack(side=tk.LEFT, padx=(0, 14))
 
-        # Issue 2: 指定フォルダは DropZone（初期非表示）
         self.custom_out_zone = DropZone(
             out_frame, "指定出力フォルダ",
             "出力先フォルダをドラッグ&ドロップ、またはクリックして選択",
             select_mode="folder", allow_multiple=False
         )
-        # 初期状態では非表示（same モード）
-        # pack は _toggle_custom_out() で制御
-
-        # out_frame の下端余白
         tk.Frame(out_frame, bg=C["surface"], height=8).pack()
 
-        # ── ファイル件数プレビュー ──
-        self.count_lbl = tk.Label(
-            main, text="",
-            font=("Helvetica", 9),
-            bg=C["bg"], fg=C["sub"]
-        )
+        # ── 変換エンジン表示 ──
+        _os = platform.system()
+        if _os == "Darwin":
+            _engine_hint = "変換: ネイティブ Office（AppleScript）優先 / LibreOffice フォールバック"
+        elif _os == "Windows":
+            _engine_hint = "変換: ネイティブ Office（COM）優先 / LibreOffice フォールバック"
+        else:
+            _engine_hint = "変換: LibreOffice"
+        tk.Label(main, text=_engine_hint,
+                 font=("Helvetica", 8), bg=C["bg"], fg="#5A7AAA"
+                 ).pack(padx=16, anchor="w")
+
+        self.count_lbl = tk.Label(main, text="",
+                                  font=("Helvetica", 9), bg=C["bg"], fg=C["sub"])
         self.count_lbl.pack(padx=16, anchor="w")
 
         section_divider(main)
 
-        # ── 実行 / キャンセル（Issue 1: FlatButton）──
         btn_row = tk.Frame(main, bg=C["bg"])
         btn_row.pack(pady=(0, 10))
 
         self.run_btn = FlatButton(
-            btn_row, text="▶  PDF変換を開始",
-            command=self._run,
+            btn_row, text="▶  PDF変換を開始", command=self._run,
             font=("Helvetica", 14), bold=True,
             bg=C["accent"], fg="#AACFEE",
-            padx=30, pady=12,
-            cursor="arrow", state=tk.DISABLED
+            padx=30, pady=12, cursor="arrow", state=tk.DISABLED
         )
         self.run_btn.pack(side=tk.LEFT, padx=(0, 12))
 
         self.cancel_btn = FlatButton(
-            btn_row, text="■ 中断",
-            command=self._cancel,
+            btn_row, text="■ 中断", command=self._cancel,
             font=("Helvetica", 11),
             bg="#3A1010", fg=C["err"],
-            padx=16, pady=12,
-            cursor="arrow", state=tk.DISABLED
+            padx=16, pady=12, cursor="arrow", state=tk.DISABLED
         )
         self.cancel_btn.pack(side=tk.LEFT)
 
-        # ── ログ ──
         self.log_txt = make_log_widget(main)
         log_write(self.log_txt, "フォルダをドロップして変換を開始してください", "info")
+        log_write(self.log_txt, _engine_hint, "info")
 
-        # ── LibreOffice 確認メッセージ ──
         lo = _get_libreoffice_path()
         lo_exists = os.path.exists(lo.strip('"')) if lo != "soffice" else True
         if not lo_exists:
             log_write(self.log_txt,
-                      "⚠️  LibreOffice が見つかりません。インストールしてください。",
+                      "⚠️  LibreOffice が見つかりません（フォールバック不可）",
                       "warning")
 
-    # Issue 2: custom_out_zone を表示／非表示で切り替え
     def _toggle_custom_out(self):
         if self.out_mode.get() == "custom":
             self.custom_out_zone.pack(fill=tk.X, padx=14, pady=(6, 4))
@@ -1208,17 +1442,14 @@ class PdfFrame(LoggedFrame):
             self.run_btn.configure(state=tk.DISABLED, bg=C["accent"],
                                    fg="#AACFEE", cursor="arrow")
             return
-        # Issue 4: .pdf ファイルも集計（コピー対象）
         files = scan_all_pdf_targets(paths)
         conv  = sum(1 for f in files if f.suffix.lower() in PDF_EXTENSIONS)
         copy_ = sum(1 for f in files if f.suffix.lower() == ".pdf")
         text  = f"対象ファイル: {len(files)} 件"
         if copy_:
             text += f"  （変換 {conv}、コピー {copy_}）"
-        self.count_lbl.configure(
-            text=text,
-            fg=C["info"] if files else C["warn"]
-        )
+        self.count_lbl.configure(text=text,
+                                  fg=C["info"] if files else C["warn"])
         if files:
             self.run_btn.configure(state=tk.NORMAL, bg=C["primary"],
                                    fg="white", cursor="hand2")
@@ -1242,12 +1473,11 @@ class PdfFrame(LoggedFrame):
 
     def _worker(self):
         try:
-            src_paths  = self.src_zone.selected_paths
-            use_custom = (self.out_mode.get() == "custom")
-            custom_out_paths = self.custom_out_zone.selected_paths if use_custom else []
-            base_custom = Path(custom_out_paths[0]) if custom_out_paths else None
+            src_paths    = self.src_zone.selected_paths
+            use_custom   = (self.out_mode.get() == "custom")
+            custom_paths = self.custom_out_zone.selected_paths if use_custom else []
+            base_custom  = Path(custom_paths[0]) if custom_paths else None
 
-            # Issue 3 & 4: ファイル収集（source root を保持して階層を再現）
             all_files = []  # [(file_path, src_root)]
             for sp in src_paths:
                 sp = Path(sp)
@@ -1272,8 +1502,6 @@ class PdfFrame(LoggedFrame):
                     break
 
                 ext = f.suffix.lower()
-
-                # Issue 3: 階層構造を維持する出力先を計算
                 try:
                     rel = f.relative_to(src_root)
                 except ValueError:
@@ -1282,12 +1510,11 @@ class PdfFrame(LoggedFrame):
                 if use_custom and base_custom:
                     out_dir = base_custom / rel.parent
                 else:
-                    out_dir = f.parent  # 元フォルダ → そのまま（自然に階層維持）
+                    out_dir = f.parent
 
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 if ext == ".pdf":
-                    # Issue 4: .pdf はコピー（同一パスならスキップ）
                     dst = out_dir / f.name
                     try:
                         if dst.resolve() == f.resolve():
@@ -1305,15 +1532,12 @@ class PdfFrame(LoggedFrame):
                         fail += 1
                         self._log(f"  ✕ {e}", "error")
                 else:
-                    # Issue 4: 変換済み PDF が既に存在する場合はスキップ
                     out_pdf = out_dir / (f.stem + ".pdf")
                     if out_pdf.exists():
                         self._log(f"[{i}/{total}] スキップ（既存）: {f.stem}.pdf", "info")
                         skipped += 1
                         continue
-
                     self._log(f"[{i}/{total}] 変換: {f.name}")
-                    # Issue 5: フォーマット別フィルタ + --norestore フラグは convert_to_pdf 内
                     ok, detail = convert_to_pdf(f, out_dir)
                     if ok:
                         success += 1
@@ -1330,9 +1554,7 @@ class PdfFrame(LoggedFrame):
             self.after(0, lambda: messagebox.showinfo(
                 "PDF変換完了",
                 f"処理が完了しました！\n\n"
-                f"成功: {success} 件\n"
-                f"スキップ: {skipped} 件\n"
-                f"失敗: {fail} 件"
+                f"成功: {success} 件\nスキップ: {skipped} 件\n失敗: {fail} 件"
             ))
         except Exception as e:
             self._log(f"予期しないエラー: {e}", "error")
@@ -1373,8 +1595,6 @@ class RakurakuJC:
         self._current = None
         self._show_launcher()
 
-    # ── アップデート確認（アプリ共通） ────────────────────────────
-
     def check_update(self):
         def _do():
             try:
@@ -1393,8 +1613,6 @@ class RakurakuJC:
                 self.root.after(0, lambda: messagebox.showerror("エラー", str(e)))
         threading.Thread(target=_do, daemon=True).start()
 
-    # ── 画面管理 ──────────────────────────────────────────────────
-
     def _clear(self):
         if self._current:
             self._current.destroy()
@@ -1402,11 +1620,7 @@ class RakurakuJC:
 
     def _show_launcher(self):
         self._clear()
-        f = LauncherFrame(
-            self.root,
-            on_link=self._show_link,
-            on_pdf=self._show_pdf
-        )
+        f = LauncherFrame(self.root, on_link=self._show_link, on_pdf=self._show_pdf)
         f.pack(fill=tk.BOTH, expand=True)
         self._current = f
 
