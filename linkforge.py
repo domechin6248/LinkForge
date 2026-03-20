@@ -152,30 +152,131 @@ def section_divider(parent):
     tk.Frame(parent, bg=C["border"], height=1).pack(fill=tk.X, padx=16, pady=(8, 10))
 
 
+# ════════════════════════════════════════════════════════════════
+#  FlatButton  ─  macOS でも bg/fg が確実に反映されるボタン
+# ════════════════════════════════════════════════════════════════
+
+class FlatButton(tk.Frame):
+    """tk.Frame + tk.Label の組み合わせで macOS ネイティブテーマを回避。
+    tk.Button と同じ引数でほぼ互換の configure/config を持つ。"""
+
+    # tk.Button 専用で FlatButton には不要なキーを無視
+    _IGNORE = frozenset({
+        "activebackground", "activeforeground",
+        "highlightbackground", "highlightthickness",
+        "relief", "bd",
+    })
+
+    def __init__(self, parent, text="", command=None, bg=None, fg="#FFFFFF",
+                 font=("Helvetica", 9), bold=False, padx=12, pady=4,
+                 cursor="hand2", state=tk.NORMAL, **kw):
+        for k in list(kw):
+            if k in self._IGNORE:
+                del kw[k]
+
+        self._cmd    = command
+        self._state  = state
+        self._bg     = bg or C["accent"]
+        self._fg     = fg
+        self._cursor = cursor
+
+        if bold:
+            if isinstance(font, tuple) and len(font) >= 2:
+                font = (font[0], font[1], "bold")
+            else:
+                font = ("Helvetica", 9, "bold")
+
+        _cur = cursor if state == tk.NORMAL else "arrow"
+        super().__init__(parent, bg=self._bg, cursor=_cur, **kw)
+        self._lbl = tk.Label(
+            self, text=text, bg=self._bg, fg=self._fg,
+            font=font, padx=padx, pady=pady, cursor=_cur
+        )
+        self._lbl.pack(fill=tk.BOTH, expand=True)
+
+        for w in (self, self._lbl):
+            w.bind("<Button-1>", self._on_click)
+            w.bind("<Enter>",    self._on_enter)
+            w.bind("<Leave>",    self._on_leave)
+
+    # ── イベント ────────────────────────────────────────────────
+    def _on_click(self, e=None):
+        if self._state == tk.NORMAL and self._cmd:
+            self._cmd()
+
+    def _on_enter(self, e=None):
+        if self._state == tk.NORMAL:
+            super().configure(bg=C["primary"])
+            self._lbl.configure(bg=C["primary"])
+
+    def _on_leave(self, e=None):
+        if self._state == tk.NORMAL:
+            super().configure(bg=self._bg)
+            self._lbl.configure(bg=self._bg)
+
+    # ── configure / config ──────────────────────────────────────
+    def configure(self, **kw):
+        for k in list(kw):
+            if k in self._IGNORE:
+                del kw[k]
+
+        text    = kw.pop("text",    None)
+        state   = kw.pop("state",   None)
+        bg      = kw.pop("bg",      None)
+        fg      = kw.pop("fg",      None)
+        cursor  = kw.pop("cursor",  None)
+        command = kw.pop("command", None)
+        if kw:
+            super().configure(**kw)
+
+        if command is not None:
+            self._cmd = command
+        if text is not None:
+            self._lbl.configure(text=text)
+        if bg is not None:
+            self._bg = bg
+        if fg is not None:
+            self._fg = fg
+        if cursor is not None:
+            self._cursor = cursor
+
+        # Apply state LAST so bg/fg are already stored
+        if state is not None:
+            self._state = state
+
+        # Sync visuals
+        if self._state == tk.NORMAL:
+            super().configure(bg=self._bg, cursor=self._cursor)
+            self._lbl.configure(bg=self._bg, fg=self._fg, cursor=self._cursor)
+        else:
+            super().configure(bg=self._bg, cursor="arrow")
+            self._lbl.configure(bg=self._bg, fg=self._fg, cursor="arrow")
+
+    config = configure
+
+
+# ════════════════════════════════════════════════════════════════
+#  共通ボタンヘルパー
+# ════════════════════════════════════════════════════════════════
+
 def nav_button(parent, text, command):
     """画面間移動用の小さなボタン"""
-    return tk.Button(
+    return FlatButton(
         parent, text=text, command=command,
-        font=("Helvetica", 9, "bold"),
+        font=("Helvetica", 9), bold=True,
         bg=C["accent"], fg="#FFFFFF",
-        activebackground=C["primary"], activeforeground="white",
-        highlightbackground=C["accent"], highlightthickness=0,
-        relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2"
+        padx=14, pady=5
     )
 
 
 def make_btn(parent, text, command, font_size=9, bold=False,
              bg=None, fg="#FFFFFF", padx=12, pady=4, cursor="hand2", **kw):
     """共通ボタン生成ヘルパー（スタイル統一用）"""
-    bg = bg or C["accent"]
-    font_style = ("Helvetica", font_size, "bold") if bold else ("Helvetica", font_size)
-    return tk.Button(
+    return FlatButton(
         parent, text=text, command=command,
-        font=font_style, bg=bg, fg=fg,
-        activebackground=C["primary"], activeforeground="white",
-        highlightbackground=bg, highlightthickness=0,
-        relief=tk.FLAT, bd=0, padx=padx, pady=pady, cursor=cursor,
-        **kw
+        font=("Helvetica", font_size), bold=bold,
+        bg=bg or C["accent"], fg=fg,
+        padx=padx, pady=pady, cursor=cursor, **kw
     )
 
 
@@ -241,13 +342,11 @@ class DropZone(tk.Frame):
         self.path_entry.bind("<FocusOut>", self._entry_out)
         self.path_entry.bind("<Return>",   self._entry_submit)
 
-        tk.Button(
+        FlatButton(
             pf, text="読込", command=self._entry_submit,
             font=("Helvetica", 9),
             bg=C["accent"], fg="#FFFFFF",
-            activebackground=C["primary"], activeforeground="white",
-            highlightbackground=C["accent"], highlightthickness=0,
-            relief=tk.FLAT, bd=0, padx=10, pady=3, cursor="hand2"
+            padx=10, pady=3
         ).pack(side=tk.LEFT)
 
         self.info_lbl = tk.Label(
@@ -262,13 +361,11 @@ class DropZone(tk.Frame):
         bf.pack(padx=14, pady=(6, 12), anchor="w")
 
         label = "ファイル選択" if select_mode == "file" else "フォルダ選択"
-        self.sel_btn = tk.Button(
+        self.sel_btn = FlatButton(
             bf, text=label, command=self._on_click,
             font=("Helvetica", 9),
             bg=C["accent"], fg="#FFFFFF",
-            activebackground=C["primary"], activeforeground="white",
-            highlightbackground=C["accent"], highlightthickness=0,
-            relief=tk.FLAT, bd=0, padx=12, pady=4, cursor="hand2"
+            padx=12, pady=4
         )
         self.sel_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.clr_btn = None
@@ -391,13 +488,11 @@ class DropZone(tk.Frame):
             text += f"\n  … 他 {len(names)-3} 件"
         self.info_lbl.config(text=text, fg=C["ok"])
         if not self.clr_btn:
-            self.clr_btn = tk.Button(
+            self.clr_btn = FlatButton(
                 self.sel_btn.master, text="クリア", command=self._clear,
                 font=("Helvetica", 8),
                 bg="#3A1010", fg=C["err"],
-                activebackground=C["err"], activeforeground="white",
-                highlightbackground="#3A1010", highlightthickness=0,
-                relief=tk.FLAT, bd=0, padx=8, pady=3, cursor="hand2"
+                padx=8, pady=3
             )
             self.clr_btn.pack(side=tk.LEFT)
 
@@ -534,6 +629,16 @@ def process_paragraph(para, fm, part):
 #  PDF変換コア
 # ════════════════════════════════════════════════════════════════
 
+# Issue 5: フォーマット別 LibreOffice エクスポートフィルタ
+_LO_FILTER_MAP = {
+    **{e: "writer_pdf_Export"  for e in {".doc",".docx",".odt",".rtf",".txt"}},
+    **{e: "calc_pdf_Export"    for e in {".xls",".xlsx",".ods",".csv"}},
+    **{e: "impress_pdf_Export" for e in {".ppt",".pptx",".odp"}},
+    **{e: "draw_pdf_Export"    for e in {".jpg",".jpeg",".png",".bmp",
+                                          ".tiff",".tif",".gif",".webp"}},
+}
+
+
 def _get_libreoffice_path():
     if platform.system() == "Windows":
         for p in [
@@ -547,24 +652,36 @@ def _get_libreoffice_path():
         return mac if os.path.exists(mac) else "soffice"
     return "soffice"
 
-def scan_pdf_targets(paths):
-    """フォルダ / ファイルのリストから変換対象を再帰収集"""
+
+def scan_all_pdf_targets(paths):
+    """フォルダ / ファイルのリストから変換・コピー対象を再帰収集。
+    PDF_EXTENSIONS → 変換対象、.pdf → コピー対象として収集する。"""
     result = []
     for p in paths:
         p = Path(p)
         if p.is_dir():
             for f in sorted(p.rglob("*")):
-                if f.is_file() and f.suffix.lower() in PDF_EXTENSIONS:
+                if f.is_file() and (f.suffix.lower() in PDF_EXTENSIONS
+                                    or f.suffix.lower() == ".pdf"):
                     result.append(f)
-        elif p.is_file() and p.suffix.lower() in PDF_EXTENSIONS:
-            result.append(p)
+        elif p.is_file():
+            if p.suffix.lower() in PDF_EXTENSIONS or p.suffix.lower() == ".pdf":
+                result.append(p)
     return result
 
+
 def convert_to_pdf(input_path: Path, output_dir: Path, log_cb=None):
-    """1ファイルをPDFに変換。成功したらTrue"""
+    """1ファイルをPDFに変換。成功したらTrue。
+    Issue 5: --norestore / --nofirststartwizard と形式別フィルタを使用。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     lo = _get_libreoffice_path()
-    cmd = f'{lo} --headless --convert-to pdf "{input_path}" --outdir "{output_dir}"'
+    ext = input_path.suffix.lower()
+    lo_filter = _LO_FILTER_MAP.get(ext, "writer_pdf_Export")
+    cmd = (
+        f'{lo} --headless --norestore --nofirststartwizard '
+        f'--convert-to "pdf:{lo_filter}" '
+        f'"{input_path}" --outdir "{output_dir}"'
+    )
     try:
         result = subprocess.run(
             cmd, shell=True,
@@ -600,13 +717,11 @@ def build_header(parent, title, subtitle, show_version=True, on_update=None):
              ).pack(side=tk.LEFT, pady=10)
     if show_version:
         if on_update:
-            tk.Button(hdr, text="🔄", command=on_update,
-                      font=("Helvetica", 11),
-                      bg=C["accent"], fg="#AACFEE",
-                      activebackground=C["primary"], activeforeground="white",
-                      highlightbackground=C["accent"], highlightthickness=0,
-                      relief=tk.FLAT, bd=0, padx=6, cursor="hand2"
-                      ).pack(side=tk.RIGHT, pady=10)
+            FlatButton(hdr, text="🔄", command=on_update,
+                       font=("Helvetica", 11),
+                       bg=C["accent"], fg="#AACFEE",
+                       padx=6, pady=0
+                       ).pack(side=tk.RIGHT, pady=10)
         tk.Label(hdr, text=f"v{APP_VERSION}",
                  font=("Helvetica", 8),
                  bg=C["accent"], fg="#AACFEE"
@@ -802,15 +917,14 @@ class LinkFrame(LoggedFrame):
 
         section_divider(main)
 
-        self.run_btn = tk.Button(
+        # Issue 1: FlatButton で macOS カラーを確実に反映
+        self.run_btn = FlatButton(
             main,
             text="▶  リンクを作成",
             command=self._run,
-            font=("Helvetica", 14, "bold"),
+            font=("Helvetica", 14), bold=True,
             bg=C["accent"], fg="#AACFEE",
-            activebackground=C["primary"], activeforeground="white",
-            highlightbackground=C["accent"], highlightthickness=0,
-            relief=tk.FLAT, bd=0, padx=30, pady=12,
+            padx=30, pady=12,
             cursor="arrow", state=tk.DISABLED
         )
         self.run_btn.pack(pady=(0, 10))
@@ -858,12 +972,11 @@ class LinkFrame(LoggedFrame):
                      relief=tk.FLAT, bd=1
                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
             def _reset(v=var, d=p.stem): v.set(d)
-            tk.Button(row, text="戻す", command=_reset,
-                      font=("Helvetica", 8),
-                      bg=C["accent"], fg="#FFFFFF",
-                      highlightbackground=C["accent"], highlightthickness=0,
-                      relief=tk.FLAT, bd=0, padx=6, pady=2, cursor="hand2"
-                      ).pack(side=tk.LEFT)
+            FlatButton(row, text="戻す", command=_reset,
+                       font=("Helvetica", 8),
+                       bg=C["accent"], fg="#FFFFFF",
+                       padx=6, pady=2
+                       ).pack(side=tk.LEFT)
             self.folder_name_entries.append((wp, var))
 
         self.fname_outer.pack(fill=tk.X, pady=(0, 4), before=self.structure_lbl)
@@ -995,7 +1108,7 @@ class PdfFrame(LoggedFrame):
         self.src_zone.pack(fill=tk.X, **pad)
         self.src_zone.on_change = self._update_count
 
-        # ── 出力先 ──
+        # ── 出力先（Issue 2: DropZone D&D 対応）──
         out_frame = tk.Frame(main, bg=C["surface"],
                              highlightbackground=C["border"],
                              highlightthickness=2)
@@ -1023,27 +1136,17 @@ class PdfFrame(LoggedFrame):
                 relief=tk.FLAT
             ).pack(side=tk.LEFT, padx=(0, 14))
 
-        self.custom_out_entry = tk.Entry(
-            out_frame,
-            font=("Helvetica", 9),
-            bg=C["input_bg"], fg=C["sub"],
-            insertbackground=C["primary"],
-            relief=tk.FLAT, bd=1,
-            state=tk.DISABLED
+        # Issue 2: 指定フォルダは DropZone（初期非表示）
+        self.custom_out_zone = DropZone(
+            out_frame, "指定出力フォルダ",
+            "出力先フォルダをドラッグ&ドロップ、またはクリックして選択",
+            select_mode="folder", allow_multiple=False
         )
-        self.custom_out_entry.pack(fill=tk.X, padx=14, pady=(6, 4))
-        self.custom_out_entry.insert(0, "出力先フォルダのパスを入力、またはペースト...")
+        # 初期状態では非表示（same モード）
+        # pack は _toggle_custom_out() で制御
 
-        tk.Button(out_frame, text="フォルダ選択",
-                  command=self._pick_custom_out,
-                  font=("Helvetica", 9),
-                  bg=C["accent"], fg="#FFFFFF",
-                  activebackground=C["primary"], activeforeground="white",
-                  highlightbackground=C["accent"], highlightthickness=0,
-                  relief=tk.FLAT, bd=0, padx=10, pady=3, cursor="hand2",
-                  state=tk.DISABLED
-                  ).pack(anchor="w", padx=14, pady=(0, 12))
-        self._custom_btn = out_frame.winfo_children()[-1]
+        # out_frame の下端余白
+        tk.Frame(out_frame, bg=C["surface"], height=8).pack()
 
         # ── ファイル件数プレビュー ──
         self.count_lbl = tk.Label(
@@ -1055,30 +1158,26 @@ class PdfFrame(LoggedFrame):
 
         section_divider(main)
 
-        # ── 実行 / キャンセル ──
+        # ── 実行 / キャンセル（Issue 1: FlatButton）──
         btn_row = tk.Frame(main, bg=C["bg"])
         btn_row.pack(pady=(0, 10))
 
-        self.run_btn = tk.Button(
+        self.run_btn = FlatButton(
             btn_row, text="▶  PDF変換を開始",
             command=self._run,
-            font=("Helvetica", 14, "bold"),
+            font=("Helvetica", 14), bold=True,
             bg=C["accent"], fg="#AACFEE",
-            activebackground=C["primary"], activeforeground="white",
-            highlightbackground=C["accent"], highlightthickness=0,
-            relief=tk.FLAT, bd=0, padx=30, pady=12,
+            padx=30, pady=12,
             cursor="arrow", state=tk.DISABLED
         )
         self.run_btn.pack(side=tk.LEFT, padx=(0, 12))
 
-        self.cancel_btn = tk.Button(
+        self.cancel_btn = FlatButton(
             btn_row, text="■ 中断",
             command=self._cancel,
             font=("Helvetica", 11),
             bg="#3A1010", fg=C["err"],
-            activebackground=C["err"], activeforeground="white",
-            highlightbackground="#3A1010", highlightthickness=0,
-            relief=tk.FLAT, bd=0, padx=16, pady=12,
+            padx=16, pady=12,
             cursor="arrow", state=tk.DISABLED
         )
         self.cancel_btn.pack(side=tk.LEFT)
@@ -1095,18 +1194,12 @@ class PdfFrame(LoggedFrame):
                       "⚠️  LibreOffice が見つかりません。インストールしてください。",
                       "warning")
 
+    # Issue 2: custom_out_zone を表示／非表示で切り替え
     def _toggle_custom_out(self):
-        mode = self.out_mode.get()
-        state = tk.NORMAL if mode == "custom" else tk.DISABLED
-        self.custom_out_entry.configure(state=state)
-        self._custom_btn.configure(state=state)
-
-    def _pick_custom_out(self):
-        p = filedialog.askdirectory(title="出力先フォルダを選択")
-        if p:
-            self.custom_out_entry.configure(state=tk.NORMAL)
-            self.custom_out_entry.delete(0, tk.END)
-            self.custom_out_entry.insert(0, p)
+        if self.out_mode.get() == "custom":
+            self.custom_out_zone.pack(fill=tk.X, padx=14, pady=(6, 4))
+        else:
+            self.custom_out_zone.pack_forget()
 
     def _update_count(self):
         paths = self.src_zone.selected_paths
@@ -1115,9 +1208,15 @@ class PdfFrame(LoggedFrame):
             self.run_btn.configure(state=tk.DISABLED, bg=C["accent"],
                                    fg="#AACFEE", cursor="arrow")
             return
-        files = scan_pdf_targets(paths)
+        # Issue 4: .pdf ファイルも集計（コピー対象）
+        files = scan_all_pdf_targets(paths)
+        conv  = sum(1 for f in files if f.suffix.lower() in PDF_EXTENSIONS)
+        copy_ = sum(1 for f in files if f.suffix.lower() == ".pdf")
+        text  = f"対象ファイル: {len(files)} 件"
+        if copy_:
+            text += f"  （変換 {conv}、コピー {copy_}）"
         self.count_lbl.configure(
-            text=f"対象ファイル: {len(files)} 件",
+            text=text,
             fg=C["info"] if files else C["warn"]
         )
         if files:
@@ -1143,39 +1242,97 @@ class PdfFrame(LoggedFrame):
 
     def _worker(self):
         try:
-            src_paths = self.src_zone.selected_paths
-            files = scan_pdf_targets(src_paths)
-            total = len(files)
-            self._log(f"対象ファイル {total} 件を変換します...", "info")
+            src_paths  = self.src_zone.selected_paths
+            use_custom = (self.out_mode.get() == "custom")
+            custom_out_paths = self.custom_out_zone.selected_paths if use_custom else []
+            base_custom = Path(custom_out_paths[0]) if custom_out_paths else None
 
-            success, fail = 0, 0
-            for i, f in enumerate(files, 1):
+            # Issue 3 & 4: ファイル収集（source root を保持して階層を再現）
+            all_files = []  # [(file_path, src_root)]
+            for sp in src_paths:
+                sp = Path(sp)
+                if sp.is_dir():
+                    for f in sorted(sp.rglob("*")):
+                        if f.is_file():
+                            ext = f.suffix.lower()
+                            if ext in PDF_EXTENSIONS or ext == ".pdf":
+                                all_files.append((f, sp))
+                elif sp.is_file():
+                    ext = sp.suffix.lower()
+                    if ext in PDF_EXTENSIONS or ext == ".pdf":
+                        all_files.append((sp, sp.parent))
+
+            total = len(all_files)
+            self._log(f"対象ファイル {total} 件を処理します...", "info")
+
+            success, fail, skipped = 0, 0, 0
+            for i, (f, src_root) in enumerate(all_files, 1):
                 if self._cancel_flag.is_set():
                     self._log(f"中断しました（{i-1}/{total} 件処理済）", "warning")
                     break
 
-                self._log(f"[{i}/{total}] {f.name}")
+                ext = f.suffix.lower()
 
-                # 出力先を決定
-                if self.out_mode.get() == "custom":
-                    raw_out = self.custom_out_entry.get().strip()
-                    out_dir = Path(raw_out) if raw_out and raw_out != "出力先フォルダのパスを入力、またはペースト..." else f.parent
-                else:
-                    out_dir = f.parent
+                # Issue 3: 階層構造を維持する出力先を計算
+                try:
+                    rel = f.relative_to(src_root)
+                except ValueError:
+                    rel = Path(f.name)
 
-                ok, detail = convert_to_pdf(f, out_dir)
-                if ok:
-                    success += 1
-                    self._log(f"  ✓ → {f.stem}.pdf", "success")
+                if use_custom and base_custom:
+                    out_dir = base_custom / rel.parent
                 else:
-                    fail += 1
-                    self._log(f"  ✕ {detail}", "error")
+                    out_dir = f.parent  # 元フォルダ → そのまま（自然に階層維持）
+
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                if ext == ".pdf":
+                    # Issue 4: .pdf はコピー（同一パスならスキップ）
+                    dst = out_dir / f.name
+                    try:
+                        if dst.resolve() == f.resolve():
+                            self._log(f"[{i}/{total}] スキップ（同一パス）: {f.name}", "info")
+                            skipped += 1
+                            continue
+                    except Exception:
+                        pass
+                    self._log(f"[{i}/{total}] コピー: {f.name}")
+                    try:
+                        shutil.copy2(f, dst)
+                        success += 1
+                        self._log(f"  ✓ → {dst.name}", "success")
+                    except Exception as e:
+                        fail += 1
+                        self._log(f"  ✕ {e}", "error")
+                else:
+                    # Issue 4: 変換済み PDF が既に存在する場合はスキップ
+                    out_pdf = out_dir / (f.stem + ".pdf")
+                    if out_pdf.exists():
+                        self._log(f"[{i}/{total}] スキップ（既存）: {f.stem}.pdf", "info")
+                        skipped += 1
+                        continue
+
+                    self._log(f"[{i}/{total}] 変換: {f.name}")
+                    # Issue 5: フォーマット別フィルタ + --norestore フラグは convert_to_pdf 内
+                    ok, detail = convert_to_pdf(f, out_dir)
+                    if ok:
+                        success += 1
+                        self._log(f"  ✓ → {f.stem}.pdf", "success")
+                    else:
+                        fail += 1
+                        self._log(f"  ✕ {detail}", "error")
 
             self._log("")
-            self._log(f"完了！  成功 {success} 件 ／ 失敗 {fail} 件", "success")
+            self._log(
+                f"完了！  成功 {success} 件 ／ スキップ {skipped} 件 ／ 失敗 {fail} 件",
+                "success"
+            )
             self.after(0, lambda: messagebox.showinfo(
                 "PDF変換完了",
-                f"変換が完了しました！\n\n成功: {success} 件\n失敗: {fail} 件"
+                f"処理が完了しました！\n\n"
+                f"成功: {success} 件\n"
+                f"スキップ: {skipped} 件\n"
+                f"失敗: {fail} 件"
             ))
         except Exception as e:
             self._log(f"予期しないエラー: {e}", "error")
